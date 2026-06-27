@@ -1,5 +1,5 @@
 import { PaymentProvider } from './PaymentProvider';
-import crypto from 'crypto';
+import * as crypto from 'crypto';
 
 export class MockPaymentProvider implements PaymentProvider {
   async createOrder(amount: number, currency: string, receiptId: string): Promise<{ id: string, status: string, amount: number }> {

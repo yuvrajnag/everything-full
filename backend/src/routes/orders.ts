@@ -45,6 +45,10 @@ router.post('/', checkoutLimiter, async (req, res) => {
     const { items, paymentMethod, shippingAddress } = parsed.data;
     const userId = req.headers['x-user-id'] as string | undefined;
     
+    if (!userId) {
+      return res.status(401).json({ error: 'Unauthorized: Login required to place orders' });
+    }
+    
     // Server-side price calculation and variant lookup
     let calculatedTotal = 0;
     const orderItemsData: { variantId: string; quantity: number; priceAtPurchase: number }[] = [];
@@ -93,17 +97,33 @@ router.post('/', checkoutLimiter, async (req, res) => {
         }
       }
       
+      // Create Address
+      const address = await tx.address.create({
+        data: {
+          userId: userId,
+          firstName: shippingAddress.firstName,
+          lastName: shippingAddress.lastName,
+          addressLine: shippingAddress.address,
+          city: shippingAddress.city,
+          state: shippingAddress.state,
+          pinCode: shippingAddress.pinCode,
+          country: shippingAddress.country,
+          phone: shippingAddress.phone
+        }
+      });
+      
       // Create Order
       const newOrder = await tx.order.create({
         data: {
           totalAmount: calculatedTotal,
           status: 'PENDING',
-          userId: userId || null,
+          userId: userId,
+          addressId: address.id,
           items: {
             create: orderItemsData
           }
         },
-        include: { items: true }
+        include: { items: true, address: true }
       });
       
       return newOrder;
@@ -123,11 +143,11 @@ router.post('/', checkoutLimiter, async (req, res) => {
       }
     });
 
-    // 4. If COD, auto-confirm order (simulate flow)
-    if (paymentMethod === 'cod') {
+    // 4. If COD or Card, auto-confirm order (simulate flow)
+    if (paymentMethod === 'cod' || paymentMethod === 'card') {
       await prisma.order.update({
         where: { id: order.id },
-        data: { status: OrderStatus.PAID } // COD means processing/confirmed
+        data: { status: OrderStatus.PAID } // COD/Card means processing/confirmed
       });
     }
 
@@ -152,7 +172,10 @@ router.get('/', async (req, res) => {
     const orders = await prisma.order.findMany({
       where,
       orderBy: { createdAt: 'desc' },
-      include: { items: { include: { variant: { include: { product: { include: { images: true } } } } } } }
+      include: { 
+        items: { include: { variant: { include: { product: { include: { images: true } } } } } },
+        address: true
+      }
     });
     
     // Adapt to frontend expected structure
@@ -169,7 +192,8 @@ router.get('/', async (req, res) => {
         },
         quantity: i.quantity,
         priceAtPurchase: i.priceAtPurchase
-      }))
+      })),
+      shippingAddress: o.address
     }));
     
     res.json(mapped);
@@ -182,7 +206,10 @@ router.get('/:id', async (req, res) => {
   try {
     const order = await prisma.order.findUnique({
       where: { id: req.params.id as string },
-      include: { items: { include: { variant: { include: { product: { include: { images: true } } } } } } }
+      include: { 
+        items: { include: { variant: { include: { product: { include: { images: true } } } } } },
+        address: true 
+      }
     });
     
     if (!order) {
@@ -213,7 +240,8 @@ router.get('/:id', async (req, res) => {
         },
         quantity: i.quantity,
         priceAtPurchase: i.priceAtPurchase
-      }))
+      })),
+      shippingAddress: order.address
     });
   } catch (error) {
     res.status(500).json({ error: 'Failed to fetch order' });
