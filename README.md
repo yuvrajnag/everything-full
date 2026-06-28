@@ -1,54 +1,53 @@
-# 🛍️ EVERYTHING Store
+# EVERYTHING
 
 ![Everything Store Banner](https://raw.githubusercontent.com/yuvrajnag/everything-full/main/frontend/public/stuff/e.png)
 
-An industrial-standard, highly scalable e-commerce application engineered by **Silver Cloud Labs**. This project demonstrates a production-ready architecture featuring atomic inventory transactions, internal proxy security, and a beautiful, modern UI/UX.
+An industrial-standard, highly scalable e-commerce architecture engineered by **Silver Cloud Labs**. This project demonstrates a production-ready ecosystem featuring atomic inventory transactions, internal proxy security, and a minimalist, state-of-the-art UI/UX.
 
 ---
 
-## 🏗️ System Design & Architecture
+## SYSTEM DESIGN & ARCHITECTURE
 
-The `everything` project splits the stack into a decoupled frontend and backend. To ensure maximum security, the backend is **not directly exposed** to the public internet for client requests. Instead, the Next.js frontend acts as a **secure proxy gateway**.
+The `everything` project enforces strict decoupling between the client and server. To ensure maximum security, the backend is **not directly exposed** to the public internet for client requests. Instead, the Next.js frontend acts as a secure proxy gateway.
 
-### 🔐 Internal Proxy Security Pattern
+### Internal Proxy Security Pattern
 1. The user interacts with the Next.js frontend (hosted on Vercel).
-2. API calls (like `/api/proxy/orders`) hit the Next.js server first.
-3. The Next.js server validates the session and injects a cryptographic `INTERNAL_API_KEY` into the headers.
+2. API calls (e.g., `/api/proxy/orders`) are routed to the Next.js edge first.
+3. The Next.js server validates the session and injects a cryptographic `INTERNAL_API_KEY` into the request headers.
 4. The Next.js server proxies the request to the Express backend (hosted on Railway).
-5. The backend verifies the `INTERNAL_API_KEY` and rejects any request missing it, preventing malicious actors from bypassing the frontend.
+5. The backend verifies the `INTERNAL_API_KEY` and rejects any request missing it, neutralizing direct external API spoofing.
 
-### 🛡️ ACID Transactions & Concurrency
-To prevent "race conditions" where two users buy the last item at the exact same millisecond, the backend uses **Prisma `$transactions`**. When an order is placed, the database atomically checks stock, reserves the quantity, and creates the order in a single, locked transaction.
+### ACID Transactions & Concurrency
+To eliminate race conditions (e.g., concurrent purchases of a single remaining item), the backend utilizes **Prisma `$transactions`**. When an order is placed, the database atomically checks stock, reserves the quantity, and creates the order within a single, isolated transaction block.
 
-### ⚡ Distributed Rate Limiting
-The backend is protected by Redis-backed rate limiters (via Upstash). If an attacker attempts to spam payment endpoints or login routes, Redis tracks their IP across all server instances and blocks them.
+### Distributed Rate Limiting
+The backend infrastructure is protected by distributed rate limiters backed by Redis (via Upstash). Malicious attempts to brute-force payment endpoints or authentication routes are tracked across all server instances and blocked at the network level.
 
 ---
 
-## 💻 Tech Stack
+## TECHNOLOGY STACK
 
-### Frontend (UI & Client)
-* **Framework:** [Next.js 15](https://nextjs.org/) (React 19) using the App Router
-* **Styling:** Tailwind CSS (Custom glassmorphism & micro-animations)
-* **State Management:** Zustand (Lightning-fast client-side persistence)
+### Frontend (Client Layer)
+* **Framework:** [Next.js 15](https://nextjs.org/) (React 19) via App Router
+* **Styling:** Tailwind CSS (Engineered for glassmorphism and micro-animations)
+* **State Management:** Zustand (High-performance client-side persistence)
 * **Authentication:** NextAuth.js (Auth.js) with Google OAuth 2.0
-* **Icons:** Lucide React
-* **Deployment:** Vercel
+* **Deployment:** Vercel Edge Network
 
-### Backend (API & Business Logic)
+### Backend (API Layer)
 * **Framework:** Node.js with Express.js (100% TypeScript)
-* **Validation:** Zod (Strict runtime schema validation)
+* **Validation:** Zod (Strict runtime schema parsing)
 * **ORM:** Prisma
 * **Deployment:** Railway
 
 ### Database & Infrastructure
 * **Primary Database:** PostgreSQL (Hosted on Supabase)
 * **Connection Pooling:** PgBouncer
-* **Caching & Rate Limiting:** Redis (Hosted on Upstash)
+* **Caching & Limits:** Redis (Hosted on Upstash)
 
 ---
 
-## 📂 Directory Structure
+## DIRECTORY STRUCTURE
 
 ```text
 everything-full/
@@ -74,7 +73,7 @@ everything-full/
 
 ---
 
-## 🚀 How to Run Locally
+## LOCAL DEVELOPMENT
 
 ### Prerequisites
 - [Node.js](https://nodejs.org/en/) (v18+)
@@ -82,41 +81,41 @@ everything-full/
 - Redis Database URL (Upstash recommended)
 - Google OAuth Client ID & Secret
 
-### 1. Backend Setup
+### 1. Backend Initialization
 ```bash
 cd backend
 npm install
 
-# Set up your .env file
+# Configure environment
 cp .env.example .env
-# Fill in DATABASE_URL, DIRECT_URL, REDIS_URL, and INTERNAL_API_KEY
+# Required: DATABASE_URL, DIRECT_URL, REDIS_URL, INTERNAL_API_KEY
 
-# Generate Prisma Client & push schema to database
+# Generate Prisma Client & sync schema
 npx prisma generate
 npx prisma db push
 
-# Start the development server
+# Boot server
 npm run dev
 ```
 
-### 2. Frontend Setup
+### 2. Frontend Initialization
 ```bash
 cd frontend
 npm install
 
-# Set up your .env file
+# Configure environment
 cp .env.example .env
-# Fill in NEXTAUTH_SECRET, GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET
-# Ensure INTERNAL_API_KEY matches the backend
-# Set NEXT_PUBLIC_API_URL to your local backend (http://localhost:5000/api)
+# Required: NEXTAUTH_SECRET, GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET
+# Ensure INTERNAL_API_KEY matches the backend configuration
+# Set NEXT_PUBLIC_API_URL to http://localhost:5000/api
 
-# Start the Next.js development server
+# Boot client
 npm run dev
 ```
 
-The application will now be running at `http://localhost:3000`.
+The application will initialize at `http://localhost:3000`.
 
 ---
 
-## ⚠️ Project Disclosure
+## PROJECT DISCLOSURE
 This application is a proprietary demonstration platform engineered by Silver Cloud Labs (a division of Beyond Studios). It is specifically designed as a controlled environment for testing advanced Artificial Intelligence models, automated agent workflows, and next-generation UI/UX interactions. All products, prices, and payments are strictly mocked for demonstration purposes.
