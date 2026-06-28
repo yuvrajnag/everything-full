@@ -211,7 +211,7 @@ export default function ProfilePage() {
                           </div>
                         </div>
                         <div className="text-xl font-bold">
-                          ₹{order.totalAmount.toLocaleString('en-IN')}
+                          ₹{(order.totalAmount / 100).toLocaleString('en-IN')}
                         </div>
                       </div>
 

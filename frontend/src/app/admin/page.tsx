@@ -147,8 +147,8 @@ export default function AdminDashboard() {
                           ))}
                         </div>
                       </td>
-                      <td className="p-4 align-top text-white font-bold">
-                        {"₹" + order.totalAmount.toLocaleString("en-IN")}
+                      <td className="px-6 py-4 whitespace-nowrap text-sm font-medium">
+                        {"₹" + (order.totalAmount / 100).toLocaleString("en-IN")}
                       </td>
                       <td className="p-4 align-top text-center">
                         <div className="flex flex-col items-center justify-center gap-1 mt-1">
