@@ -63,7 +63,7 @@ export default function PayPage({ params }: { params: Promise<{ orderId: string 
         
         <div className="w-full bg-black border border-[#222] p-6 mb-8 flex flex-col items-center">
           <span className="text-xs text-gray-500 uppercase font-bold tracking-widest mb-2">Amount to Pay</span>
-          <span className="text-4xl font-black text-white">{"₹" + order.totalAmount.toLocaleString("en-IN")}</span>
+          <span className="text-4xl font-black text-white">{"₹" + (order.totalAmount / 100).toLocaleString("en-IN")}</span>
         </div>
 
         {success ? (
