@@ -10,8 +10,15 @@ const formatProduct = (p: any) => {
     return '₹' + (paise / 100).toLocaleString('en-IN');
   };
 
-  const primaryImage = p.images?.find((img: any) => img.isPrimary)?.url;
-  const hoverImage = p.images?.find((img: any) => !img.isPrimary)?.url;
+  let primaryImage = p.images?.find((img: any) => img.isPrimary)?.url;
+  let hoverImage = p.images?.find((img: any) => !img.isPrimary)?.url;
+
+  if (primaryImage && primaryImage.includes('res.cloudinary.com')) {
+     primaryImage = `/products/${primaryImage.split('/').pop()}`;
+  }
+  if (hoverImage && hoverImage.includes('res.cloudinary.com')) {
+     hoverImage = `/products/${hoverImage.split('/').pop()}`;
+  }
 
   return {
     id: p.id,
@@ -30,7 +37,7 @@ const formatProduct = (p: any) => {
 
 router.get('/', async (req, res) => {
   try {
-    const cached = await redis.get('products:all');
+    const cached = await redis.get('products:all:v2');
     if (cached) {
       res.json(JSON.parse(cached));
       return;
@@ -44,7 +51,7 @@ router.get('/', async (req, res) => {
     });
     const mapped = products.map(formatProduct);
     
-    await redis.setex('products:all', 5 * 60, JSON.stringify(mapped)); // Cache for 5 mins
+    await redis.setex('products:all:v2', 5 * 60, JSON.stringify(mapped)); // Cache for 5 mins
     res.json(mapped);
   } catch (error) {
     console.error('[ERROR] Fetch products:', error);
@@ -55,7 +62,7 @@ router.get('/', async (req, res) => {
 router.get('/:slug', async (req, res) => {
   try {
     const slug = req.params.slug;
-    const cached = await redis.get(`product:${slug}`);
+    const cached = await redis.get(`product:${slug}:v2`);
     if (cached) {
       res.json(JSON.parse(cached));
       return;
@@ -79,7 +86,7 @@ router.get('/:slug', async (req, res) => {
     }
     
     const formatted = formatProduct(product);
-    await redis.setex(`product:${slug}`, 5 * 60, JSON.stringify(formatted)); // Cache for 5 mins
+    await redis.setex(`product:${slug}:v2`, 5 * 60, JSON.stringify(formatted)); // Cache for 5 mins
     res.json(formatted);
   } catch (error) {
     console.error('[ERROR] Fetch product:', error);
