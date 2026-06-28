@@ -1,5 +1,39 @@
+# Dependencies
 node_modules/
+
+# Build outputs
 .next/
 dist/
+out/
+
+# Logs
 *.log
+
+# Environment files
+.env
+.env.local
+.env.production
+.env.development.local
+.env.test.local
+.env.production.local
+
+# OS files
 .DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+
+# Coverage
+coverage/
+
+# Database files
+*.db
+prisma/dev.db
+
+# Compiled JS from tsc (backend src/)
+backend/src/**/*.js
+backend/src/**/*.js.map
+backend/src/**/*.d.ts
+backend/src/**/*.d.ts.map

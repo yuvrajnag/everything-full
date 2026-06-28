@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import { prisma } from '../db';
+import redis from '../lib/redis';
 
 const router = Router();
 
@@ -29,6 +30,12 @@ const formatProduct = (p: any) => {
 
 router.get('/', async (req, res) => {
   try {
+    const cached = await redis.get('products:all');
+    if (cached) {
+      res.json(JSON.parse(cached));
+      return;
+    }
+
     const products = await prisma.product.findMany({
       include: {
         category: true,
@@ -36,16 +43,26 @@ router.get('/', async (req, res) => {
       }
     });
     const mapped = products.map(formatProduct);
+    
+    await redis.setex('products:all', 5 * 60, JSON.stringify(mapped)); // Cache for 5 mins
     res.json(mapped);
   } catch (error) {
+    console.error('[ERROR] Fetch products:', error);
     res.status(500).json({ error: 'Failed to fetch products' });
   }
 });
 
 router.get('/:slug', async (req, res) => {
   try {
+    const slug = req.params.slug;
+    const cached = await redis.get(`product:${slug}`);
+    if (cached) {
+      res.json(JSON.parse(cached));
+      return;
+    }
+
     const product = await prisma.product.findUnique({
-      where: { slug: req.params.slug },
+      where: { slug },
       include: {
         category: true,
         images: true,
@@ -60,8 +77,12 @@ router.get('/:slug', async (req, res) => {
        res.status(404).json({ error: 'Product not found' });
        return;
     }
-    res.json(formatProduct(product));
+    
+    const formatted = formatProduct(product);
+    await redis.setex(`product:${slug}`, 5 * 60, JSON.stringify(formatted)); // Cache for 5 mins
+    res.json(formatted);
   } catch (error) {
+    console.error('[ERROR] Fetch product:', error);
     res.status(500).json({ error: 'Failed to fetch product' });
   }
 });

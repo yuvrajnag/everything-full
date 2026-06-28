@@ -90,6 +90,7 @@ model Address {
   pinCode     String
   country     String
   phone       String
+  email       String?
 
   user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
   orders      Order[]
