@@ -3,38 +3,65 @@
 import { useEffect, useState } from "react";
 import { Navbar } from "@/components/layout/Navbar";
 import { useUserStore } from "@/store/userStore";
-import { CreditCard, MapPin, Mail, Phone, Clock, ChevronRight, Package, User, X } from "lucide-react";
+import { ShieldCheck, MapPin, Mail, Phone, Clock, ChevronRight, Package, User, X, AlertTriangle, RefreshCw } from "lucide-react";
 import Link from "next/link";
 import Image from "next/image";
 
-import { signOut } from "next-auth/react";
+import { signOut, useSession } from "next-auth/react";
+import { apiFetch, ApiError, errorMessage } from "@/lib/api";
+import { formatPaise } from "@/lib/format";
+import { useCallback } from "react";
+
+/** Colour-codes the status chip on each order card. */
+const STATUS_STYLES: Record<string, string> = {
+  PENDING: "bg-[#FFB020]/20 text-[#FFB020]",
+  PAID: "bg-[#00a86b]/20 text-[#00a86b]",
+  CONFIRMED: "bg-[#00a86b]/20 text-[#00a86b]",
+  SHIPPED: "bg-[#39729b]/20 text-[#7db9e0]",
+  DELIVERED: "bg-[#00a86b]/20 text-[#00a86b]",
+  CANCELLED: "bg-[#222] text-gray-400",
+  REFUNDED: "bg-[#222] text-gray-400",
+};
+
+const STATUS_LABELS: Record<string, string> = {
+  PENDING: "Awaiting payment",
+  CONFIRMED: "Confirmed",
+};
 
 export default function ProfilePage() {
+  const { data: session } = useSession();
   const profile = useUserStore(state => state.profile);
   const [orders, setOrders] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [mounted, setMounted] = useState(false);
   const [showEditModal, setShowEditModal] = useState(false);
   const [editForm, setEditForm] = useState(profile);
 
+  const loadOrders = useCallback(async () => {
+    setLoading(true);
+    setLoadError(null);
+    try {
+      const data = await apiFetch<any[]>("orders");
+      setOrders(Array.isArray(data) ? data : []);
+    } catch (err) {
+      // Previously any failure here left an empty list that looked exactly
+      // like "you have no orders". Say what actually happened instead.
+      setOrders([]);
+      setLoadError(
+        err instanceof ApiError && err.isAuthError
+          ? "Your session has expired. Please sign in again to see your orders."
+          : errorMessage(err)
+      );
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
   useEffect(() => {
     setMounted(true);
-    fetch("/api/proxy/orders")
-      .then(res => res.json())
-      .then(data => {
-        if (Array.isArray(data)) {
-          setOrders(data);
-        } else {
-          console.error('API Error:', data);
-          setOrders([]);
-        }
-        setLoading(false);
-      })
-      .catch(err => {
-        console.error(err);
-        setLoading(false);
-      });
-  }, []);
+    loadOrders();
+  }, [loadOrders]);
 
   if (!mounted) return null;
 
@@ -124,11 +151,17 @@ export default function ProfilePage() {
             <div className="flex flex-col gap-4">
               <div className="flex items-center gap-4 text-sm font-medium">
                 <User className="text-gray-500" size={18} />
-                <span>{profile.firstName} {profile.lastName}</span>
+                {/* Before the first checkout there is nothing in local storage,
+                    so fall back to the signed-in Google account. */}
+                <span>
+                  {`${profile.firstName} ${profile.lastName}`.trim() ||
+                    session?.user?.name ||
+                    "Your account"}
+                </span>
               </div>
               <div className="flex items-center gap-4 text-sm font-medium">
                 <Mail className="text-gray-500" size={18} />
-                <span>{profile.email}</span>
+                <span>{profile.email || session?.user?.email || "Not provided"}</span>
               </div>
               <div className="flex items-center gap-4 text-sm font-medium">
                 <Phone className="text-gray-500" size={18} />
@@ -151,19 +184,13 @@ export default function ProfilePage() {
           </div>
 
           <div className="bg-[#111] border border-[#222] p-8 flex flex-col gap-6">
-            <h2 className="text-sm font-bold uppercase tracking-widest text-gray-400 border-b border-[#333] pb-4">Payment Method</h2>
-            <div className="flex items-center gap-4 text-sm font-medium">
-              <CreditCard className="text-gray-500" size={18} />
-              <div>
-                {profile.cardNumber ? (
-                  <>
-                    <p>Card ending in {profile.cardNumber.slice(-4)}</p>
-                    <p className="text-xs text-gray-500 mt-1">Expires: {profile.cardExpiry}</p>
-                  </>
-                ) : (
-                  <p className="text-gray-500">No saved cards</p>
-                )}
-              </div>
+            <h2 className="text-sm font-bold uppercase tracking-widest text-gray-400 border-b border-[#333] pb-4">Payment</h2>
+            <div className="flex items-start gap-4 text-sm font-medium">
+              <ShieldCheck className="text-[#00a86b] shrink-0 mt-0.5" size={18} />
+              <p className="text-gray-400 leading-relaxed">
+                Card and UPI details are entered in Razorpay&apos;s secure window at checkout.
+                We never store your payment credentials.
+              </p>
             </div>
           </div>
         </div>
@@ -175,6 +202,20 @@ export default function ProfilePage() {
           {loading ? (
             <div className="flex items-center justify-center py-20">
               <div className="w-8 h-8 border-4 border-[#333] border-t-[#FF003C] rounded-full animate-spin"></div>
+            </div>
+          ) : loadError ? (
+            <div role="alert" className="bg-[#1a0509] border border-[#FF003C] p-8 flex flex-col items-start gap-4">
+              <div className="flex items-center gap-3">
+                <AlertTriangle size={20} className="text-[#FF003C]" />
+                <p className="text-sm font-bold uppercase tracking-widest text-[#FF003C]">Couldn&apos;t load your orders</p>
+              </div>
+              <p className="text-sm text-gray-300 font-medium">{loadError}</p>
+              <button
+                onClick={loadOrders}
+                className="flex items-center gap-2 py-3 px-6 border border-[#333] hover:border-white text-white font-bold uppercase tracking-wider text-xs transition-colors"
+              >
+                <RefreshCw size={14} /> Try again
+              </button>
             </div>
           ) : orders.length === 0 ? (
             <div className="bg-[#111] border border-[#222] p-12 flex flex-col items-center justify-center text-center">
@@ -189,36 +230,42 @@ export default function ProfilePage() {
             <div className="flex flex-col gap-6">
               {orders.map((order) => {
                 const date = new Date(order.createdAt).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
-                const isCancelled = order.status === "CANCELLED";
+                const isCancelled = order.status === "CANCELLED" || order.status === "REFUNDED";
+                const statusStyle = STATUS_STYLES[order.status] ?? "bg-[#FF003C]/20 text-[#FF003C]";
+                const statusLabel = STATUS_LABELS[order.status] ?? order.status;
+                const refunded = (order.payment?.refundedAmountPaise ?? 0) > 0;
                 
                 return (
                   <div key={order.id} className="bg-[#111] border border-[#222] hover:border-[#444] transition-colors group relative overflow-hidden">
                     {/* Status indicator bar */}
-                    <div className={`absolute top-0 left-0 w-1 h-full ${isCancelled ? 'bg-gray-600' : order.status === 'PAID' ? 'bg-[#00a86b]' : 'bg-[#FF003C]'}`}></div>
+                    <div className={`absolute top-0 left-0 w-1 h-full ${isCancelled ? 'bg-gray-600' : (order.status === 'PAID' || order.status === 'CONFIRMED' || order.status === 'DELIVERED') ? 'bg-[#00a86b]' : 'bg-[#FF003C]'}`}></div>
                     
                     <div className="p-6 md:p-8">
                       <div className="flex flex-col md:flex-row justify-between md:items-center gap-4 mb-6 pb-6 border-b border-[#222]">
                         <div>
                           <div className="flex items-center gap-3 mb-1">
                             <span className="text-xs font-bold uppercase tracking-widest text-gray-500">Order #{order.id.slice(0,8).toUpperCase()}</span>
-                            <span className={`text-[10px] px-2 py-1 font-bold uppercase tracking-widest ${isCancelled ? 'bg-[#222] text-gray-400' : 'bg-[#FF003C]/20 text-[#FF003C]'}`}>
-                              {order.status}
+                            <span className={`text-[10px] px-2 py-1 font-bold uppercase tracking-widest ${statusStyle}`}>
+                              {statusLabel}
                             </span>
+                            {refunded && (
+                              <span className="text-[10px] px-2 py-1 font-bold uppercase tracking-widest bg-[#222] text-gray-300">
+                                Refunded {formatPaise(order.payment.refundedAmountPaise)}
+                              </span>
+                            )}
                           </div>
                           <div className="flex items-center gap-2 text-sm text-gray-400 font-medium">
                             <Clock size={14} />
                             Placed on {date}
                           </div>
                         </div>
-                        <div className="text-xl font-bold">
-                          ₹{(order.totalAmount / 100).toLocaleString('en-IN')}
-                        </div>
+                        <div className="text-xl font-bold">{formatPaise(order.totalPaise)}</div>
                       </div>
 
                       <div className="flex items-center gap-4 mb-6 overflow-x-auto pb-2">
                         {order.items.map((item: any) => (
                           <div key={item.id} className="relative w-16 h-16 bg-black border border-[#333] shrink-0 p-1">
-                            <Image src={item.product.imageUrl} alt={item.product.title} fill className="object-contain" />
+                            <Image src={item.product.imageUrl || "/logos/favicon.png"} alt={item.product.title} fill className="object-contain" />
                             {item.quantity > 1 && (
                               <div className="absolute -top-2 -right-2 w-5 h-5 bg-[#FF003C] rounded-full flex items-center justify-center text-[10px] font-bold text-white z-10">
                                 {item.quantity}
@@ -232,7 +279,7 @@ export default function ProfilePage() {
                         href={`/track?id=${order.id}`}
                         className="flex items-center justify-between text-xs font-bold uppercase tracking-widest text-gray-300 hover:text-white transition-colors"
                       >
-                        {isCancelled ? 'View Details' : 'Track Order'}
+                        {order.awaitingPayment ? 'Complete payment' : isCancelled ? 'View details' : 'Track order'}
                         <ChevronRight size={16} className="group-hover:translate-x-1 transition-transform" />
                       </Link>
                     </div>

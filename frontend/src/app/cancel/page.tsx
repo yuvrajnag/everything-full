@@ -2,9 +2,11 @@
 
 import { Navbar } from "@/components/layout/Navbar";
 import Link from "next/link";
-import { ArrowLeft, AlertTriangle } from "lucide-react";
+import { ArrowLeft, AlertTriangle, Loader2 } from "lucide-react";
 import { useSearchParams, useRouter } from "next/navigation";
-import { useState, Suspense } from "react";
+import { useState, useEffect, useCallback, Suspense } from "react";
+import { apiFetch, errorMessage } from "@/lib/api";
+import { formatPaise } from "@/lib/format";
 
 function CancelContent() {
   const searchParams = useSearchParams();
@@ -14,6 +16,8 @@ function CancelContent() {
   const [selectedReason, setSelectedReason] = useState("");
   const [details, setDetails] = useState("");
   const [isProcessing, setIsProcessing] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [order, setOrder] = useState<any>(null);
 
   const reasons = [
     "I changed my mind",
@@ -22,23 +26,37 @@ function CancelContent() {
     "Ordered by mistake"
   ];
 
-  const handleCancel = async () => {
+  // Load the order so the page can say honestly whether a refund is coming.
+  const loadOrder = useCallback(async () => {
     if (!id) return;
-    setIsProcessing(true);
     try {
-      const res = await fetch(`/api/proxy/orders/${id}/cancel`, {
-        method: "POST"
+      setOrder(await apiFetch(`orders/${id}`));
+    } catch {
+      // Non-fatal: the cancel call below reports any real problem.
+    }
+  }, [id]);
+
+  useEffect(() => { loadOrder(); }, [loadOrder]);
+
+  const willRefund = order?.payment?.status === "SUCCESS";
+
+  const handleCancel = async () => {
+    if (!id || isProcessing) return;
+    setIsProcessing(true);
+    setError(null);
+    try {
+      await apiFetch(`orders/${id}/cancel`, {
+        method: "POST",
+        // Refunds can take a few seconds to clear the payment provider.
+        timeoutMs: 60_000,
       });
-      if (res.ok) {
-        router.push(`/track?id=${id}`);
-      } else {
-        alert("Failed to cancel order.");
-      }
+      router.push(`/track?id=${id}`);
     } catch (err) {
-      console.error(err);
-      alert("Error cancelling order");
-    } finally {
+      // The backend refuses to cancel when a refund could not be issued, so
+      // the customer needs to see exactly why rather than "Failed to cancel".
+      setError(errorMessage(err));
       setIsProcessing(false);
+      window.scrollTo({ top: 0, behavior: "smooth" });
     }
   };
 
@@ -66,13 +84,27 @@ function CancelContent() {
         </p>
       </div>
 
+      {error && (
+        <div role="alert" className="bg-[#1a0509] border border-[#FF003C] p-6 mb-8 flex gap-4 items-start">
+          <AlertTriangle size={24} className="text-[#FF003C] shrink-0" />
+          <div>
+            <h3 className="text-sm font-bold uppercase tracking-widest text-[#FF003C] mb-2">Cancellation failed</h3>
+            <p className="text-sm text-gray-300 font-medium leading-relaxed">{error}</p>
+          </div>
+        </div>
+      )}
+
       {/* Warning Alert */}
       <div className="bg-[#111] border border-[#FF003C] p-6 mb-12 flex gap-4 items-start">
         <AlertTriangle size={24} className="text-[#FF003C] shrink-0" />
         <div>
           <h3 className="text-sm font-bold uppercase tracking-widest text-[#FF003C] mb-2">Warning: Permanent Action</h3>
           <p className="text-sm text-gray-400 font-medium leading-relaxed">
-            Order cancellations cannot be undone. Once confirmed, your shipment will be intercepted. Any amounts charged will be refunded to your original payment method within 5-7 business days.
+            Order cancellations cannot be undone. Once confirmed, your shipment will be intercepted.
+            {" "}
+            {willRefund
+              ? `We'll refund ${formatPaise(order?.payment?.amountPaise)} to your original payment method; it usually lands within 5-7 business days. If the refund can't be issued, your order stays active and nothing changes.`
+              : "Nothing has been charged for this order, so there is no refund to process."}
           </p>
         </div>
       </div>
@@ -111,9 +143,17 @@ function CancelContent() {
         <button 
           onClick={handleCancel}
           disabled={!selectedReason || isProcessing}
+          aria-busy={isProcessing}
           className="py-4 px-8 font-bold text-xs uppercase tracking-widest bg-[#FF003C] disabled:bg-gray-800 text-white hover:bg-[#CC0030] transition-colors text-center"
         >
-          {isProcessing ? "Processing..." : "Confirm Cancellation"}
+          {isProcessing ? (
+            <span className="flex items-center gap-2 justify-center">
+              <Loader2 size={14} className="animate-spin" />
+              {willRefund ? "Issuing refund..." : "Cancelling..."}
+            </span>
+          ) : (
+            "Confirm Cancellation"
+          )}
         </button>
       </div>
     </main>

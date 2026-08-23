@@ -1,8 +1,14 @@
-export default function PaymentPage() {
-  return (
-    <div className="flex min-h-screen flex-col items-center justify-center p-24">
-      <h1 className="text-4xl font-bold">Payment</h1>
-      <p className="mt-4 text-gray-500">Minimal UI scaffold</p>
-    </div>
-  );
+import { redirect } from "next/navigation";
+
+/**
+ * Legacy route. Payment happens inside Razorpay Checkout on /checkout, or on
+ * /pay/[orderId] for an order that still needs paying.
+ */
+export default async function PaymentPage({
+  searchParams,
+}: {
+  searchParams: Promise<{ orderId?: string }>;
+}) {
+  const { orderId } = await searchParams;
+  redirect(orderId ? `/pay/${encodeURIComponent(orderId)}` : "/cart");
 }

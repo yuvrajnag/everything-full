@@ -1,96 +1,146 @@
 import { Router } from 'express';
 import { prisma } from '../db';
-import redis from '../lib/redis';
+import { redisTry } from '../lib/redis';
 
 const router = Router();
 
-// Adapter to match existing frontend contract
+/** Stock is cached briefly; checkout is always the authoritative check. */
+const CACHE_TTL_SECONDS = 60;
+const CACHE_VERSION = 'v3';
+
+/**
+ * Product shape consumed by the storefront.
+ *
+ * `pricePaise` is authoritative; `price` (rupees) and `priceString` are
+ * conveniences for display. Live inventory is included so the UI can disable
+ * "Add to cart" for genuinely sold-out items instead of relying on a hardcoded
+ * "OUT OF STOCK" tag baked into the seed data.
+ */
+const formatPrice = (paise: number) => '₹' + (paise / 100).toLocaleString('en-IN');
+
+const formatVariant = (v: any) => ({
+  id: v.id,
+  sku: v.sku,
+  label: v.label,
+  isDefault: v.isDefault,
+  pricePaise: v.price,
+  price: v.price / 100,
+  priceString: formatPrice(v.price),
+  stockAvailable: Math.max(0, (v.inventory?.stockCount ?? 0) - (v.inventory?.reserved ?? 0)),
+});
+
 const formatProduct = (p: any) => {
-  const formatPrice = (paise: number) => {
-    return '₹' + (paise / 100).toLocaleString('en-IN');
-  };
+  const primaryImage = p.images?.find((img: any) => img.isPrimary)?.url ?? p.images?.[0]?.url ?? null;
+  const hoverImage = p.images?.find((img: any) => !img.isPrimary)?.url ?? null;
 
-  let primaryImage = p.images?.find((img: any) => img.isPrimary)?.url;
-  let hoverImage = p.images?.find((img: any) => !img.isPrimary)?.url;
-
-  if (primaryImage && primaryImage.includes('res.cloudinary.com')) {
-     primaryImage = `/products/${primaryImage.split('/').pop()}`;
-  }
-  if (hoverImage && hoverImage.includes('res.cloudinary.com')) {
-     hoverImage = `/products/${hoverImage.split('/').pop()}`;
-  }
+  const variants = (p.variants ?? []).map(formatVariant);
+  const defaultVariant = variants.find((v: any) => v.isDefault) ?? variants[0] ?? null;
+  const stockAvailable = variants.reduce((sum: number, v: any) => sum + v.stockAvailable, 0);
 
   return {
     id: p.id,
+    slug: p.slug,
     brand: p.brand,
     tag: p.tag,
     title: p.title,
     category: p.category?.name || 'Unknown',
     description: p.description,
-    price: p.basePrice / 100,
-    priceString: formatPrice(p.basePrice),
-    imageUrl: primaryImage,
-    hoverImageUrl: hoverImage,
-    hasConfig: p.isConfigurable
+    pricePaise: defaultVariant?.pricePaise ?? p.basePrice,
+    price: (defaultVariant?.pricePaise ?? p.basePrice) / 100,
+    priceString: formatPrice(defaultVariant?.pricePaise ?? p.basePrice),
+    imageUrl: toLocalImagePath(primaryImage),
+    hoverImageUrl: toLocalImagePath(hoverImage),
+    hasConfig: p.isConfigurable,
+    variants,
+    defaultVariantId: defaultVariant?.id ?? null,
+    stockAvailable,
+    inStock: stockAvailable > 0,
+    /** Announced but not yet purchasable. */
+    isUpcoming: p.tag === 'UPCOMING',
   };
 };
 
-router.get('/', async (req, res) => {
+/**
+ * Older seeds stored absolute Cloudinary URLs; the storefront serves these
+ * images from `public/products`. Normalising here means the three separate
+ * copies of this rewrite that used to live in the frontend are unnecessary.
+ */
+function toLocalImagePath(url: string | null): string | null {
+  if (!url) return null;
+  if (url.includes('res.cloudinary.com')) {
+    return `/products/${url.split('/').pop()}`;
+  }
+  return url;
+}
+
+const PRODUCT_INCLUDE = {
+  category: true,
+  images: true,
+  variants: { include: { inventory: true }, orderBy: { price: 'asc' } },
+} as const;
+
+router.get('/', async (_req, res) => {
   try {
-    const cached = await redis.get('products:all:v2');
+    const cacheKey = `products:all:${CACHE_VERSION}`;
+    const cached = await redisTry((c) => c.get(cacheKey), null);
     if (cached) {
-      res.json(JSON.parse(cached));
-      return;
+      try {
+        res.json(JSON.parse(cached));
+        return;
+      } catch {
+        // Corrupt cache entry — fall through and rebuild it.
+      }
     }
 
     const products = await prisma.product.findMany({
-      include: {
-        category: true,
-        images: true
-      }
+      include: PRODUCT_INCLUDE,
+      orderBy: { createdAt: 'asc' },
     });
     const mapped = products.map(formatProduct);
-    
-    await redis.setex('products:all:v2', 5 * 60, JSON.stringify(mapped)); // Cache for 5 mins
+
+    await redisTry((c) => c.setex(cacheKey, CACHE_TTL_SECONDS, JSON.stringify(mapped)), null);
     res.json(mapped);
   } catch (error) {
     console.error('[ERROR] Fetch products:', error);
-    res.status(500).json({ error: 'Failed to fetch products' });
+    res.status(500).json({ error: 'Could not load products.', code: 'PRODUCTS_FETCH_FAILED' });
   }
 });
 
 router.get('/:slug', async (req, res) => {
   try {
     const slug = req.params.slug;
-    const cached = await redis.get(`product:${slug}:v2`);
-    if (cached) {
-      res.json(JSON.parse(cached));
+    if (!slug || slug.length > 200) {
+      res.status(400).json({ error: 'Invalid product', code: 'INVALID_SLUG' });
       return;
+    }
+
+    const cacheKey = `product:${slug}:${CACHE_VERSION}`;
+    const cached = await redisTry((c) => c.get(cacheKey), null);
+    if (cached) {
+      try {
+        res.json(JSON.parse(cached));
+        return;
+      } catch {
+        // Corrupt cache entry — fall through and rebuild it.
+      }
     }
 
     const product = await prisma.product.findUnique({
       where: { slug },
-      include: {
-        category: true,
-        images: true,
-        variants: {
-          include: {
-            inventory: true
-          }
-        }
-      }
+      include: PRODUCT_INCLUDE,
     });
+
     if (!product) {
-       res.status(404).json({ error: 'Product not found' });
-       return;
+      res.status(404).json({ error: 'Product not found', code: 'PRODUCT_NOT_FOUND' });
+      return;
     }
-    
+
     const formatted = formatProduct(product);
-    await redis.setex(`product:${slug}:v2`, 5 * 60, JSON.stringify(formatted)); // Cache for 5 mins
+    await redisTry((c) => c.setex(cacheKey, CACHE_TTL_SECONDS, JSON.stringify(formatted)), null);
     res.json(formatted);
   } catch (error) {
     console.error('[ERROR] Fetch product:', error);
-    res.status(500).json({ error: 'Failed to fetch product' });
+    res.status(500).json({ error: 'Could not load this product.', code: 'PRODUCT_FETCH_FAILED' });
   }
 });
 
