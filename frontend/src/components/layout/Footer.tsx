@@ -42,11 +42,10 @@ export function Footer() {
 
         <div className="flex flex-col gap-4">
           <h4 className="font-bold uppercase tracking-widest text-sm mb-2">Legal & Info</h4>
-          <Link href="/demo-disclosure" className="text-gray-400 hover:text-white text-xs font-medium transition-colors">Project Disclosure</Link>
-          <Link href="/about" className="text-gray-400 hover:text-white text-xs font-medium transition-colors">About the Project</Link>
+          <Link href="/about" className="text-gray-400 hover:text-white text-xs font-medium transition-colors">About Us</Link>
           <Link href="/terms" className="text-gray-400 hover:text-white text-xs font-medium transition-colors">Terms of Use</Link>
           <Link href="/privacy" className="text-gray-400 hover:text-white text-xs font-medium transition-colors">Privacy Policy</Link>
-          <Link href="/security" className="text-gray-400 hover:text-white text-xs font-medium transition-colors">Security Architecture</Link>
+          <Link href="/security" className="text-gray-400 hover:text-white text-xs font-medium transition-colors">Security</Link>
           <Link href="/accessibility" className="text-gray-400 hover:text-white text-xs font-medium transition-colors">Accessibility Statement</Link>
         </div>
       </div>

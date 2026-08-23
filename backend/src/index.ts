@@ -154,9 +154,14 @@ app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
 
 // ─── Background jobs ───────────────────────────────────────────────────
 /**
- * Simulated logistics. Timings are deliberately long enough that a customer
- * has a realistic window to cancel — the previous 1-minute PAID -> SHIPPED
- * hop made almost every order non-cancellable before the customer could act.
+ * Development-only simulated logistics, gated behind SIMULATE_LOGISTICS.
+ *
+ * This advances orders to SHIPPED and then DELIVERED purely on elapsed time,
+ * with no dispatch behind it. That is fine for exercising the tracking UI
+ * locally, but on a real store it would tell a paying customer their order had
+ * shipped when nothing had, and would make the order non-cancellable an hour
+ * after purchase. Real fulfilment needs an operator action instead — see the
+ * note in README under "Fulfilment".
  */
 const SHIP_AFTER_MS = 60 * 60 * 1000; // 1 hour
 const DELIVER_AFTER_MS = 3 * 24 * 60 * 60 * 1000; // 3 days
@@ -165,6 +170,8 @@ const DELIVER_AFTER_MS = 3 * 24 * 60 * 60 * 1000; // 3 days
 const RESERVATION_TTL_MS = 30 * 60 * 1000; // 30 minutes
 
 async function progressOrders() {
+  if (!env.simulateLogistics) return;
+
   const now = Date.now();
 
   await prisma.order.updateMany({
@@ -274,6 +281,13 @@ let backgroundInterval: ReturnType<typeof setInterval>;
 
 const server = app.listen(env.port, () => {
   logger.info(`Server running on port ${env.port} (${env.nodeEnv})`);
+
+  if (env.simulateLogistics) {
+    logger.warn(
+      'SIMULATE_LOGISTICS is on — orders will be marked SHIPPED and DELIVERED on a ' +
+        'timer with no real dispatch. Never enable this in production.'
+    );
+  }
 
   backgroundInterval = setInterval(async () => {
     try {

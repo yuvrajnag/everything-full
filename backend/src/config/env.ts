@@ -63,6 +63,14 @@ export const env = {
     apiKey: process.env.EMAIL_API_KEY || '',
     fromAddress: process.env.EMAIL_FROM_ADDRESS || '',
   },
+
+  /**
+   * Advances PAID/CONFIRMED orders to SHIPPED and then DELIVERED on a timer,
+   * with no real dispatch behind it. Useful for local development; on a real
+   * store it tells paying customers their order shipped when nothing did, so
+   * it is off unless explicitly switched on and never on in production.
+   */
+  simulateLogistics: process.env.SIMULATE_LOGISTICS === 'true',
 } as const;
 
 /** True when Razorpay credentials are present and online payments can be taken. */
@@ -99,6 +107,14 @@ if (!emailConfigured) {
       'cancellation and payment-failure emails will be logged but not sent. ' +
       'See backend/.env.example.'
   );
+}
+
+if (env.simulateLogistics && isProduction) {
+  console.error(
+    '[FATAL] SIMULATE_LOGISTICS must not be enabled in production. It marks orders ' +
+      'SHIPPED and DELIVERED on a timer without anything actually being dispatched.'
+  );
+  process.exit(1);
 }
 
 if (env.isProduction && env.internalApiKey === 'default-dev-secret') {

@@ -139,5 +139,21 @@ one as rupees by accident. Use `frontend/src/lib/format.ts` for display.
 
 ---
 
+## FULFILMENT
+
+Order statuses advance to `SHIPPED` and `DELIVERED` only when something actually
+dispatches. The timer-based progression that used to do this automatically is
+now behind `SIMULATE_LOGISTICS`, which is for local development and which the
+server refuses to start with in production.
+
+Before going live you need a way for an operator to mark orders dispatched —
+either an admin endpoint or a direct database process. Until then, paid orders
+stay at `PAID`/`CONFIRMED`, which is honest but means customers never see a
+dispatch update.
+
+---
+
 ## PROJECT DISCLOSURE
-This application is a demonstration storefront engineered by Silver Cloud Labs (a division of Beyond Studios). Products and prices are fictional. Payments run against Razorpay in **test mode** — no real money moves unless the store is pointed at live keys.
+This storefront is operated by Silver Cloud Labs (a division of Beyond Studios).
+Payments run through Razorpay. Pointed at test-mode keys no real money moves;
+pointed at live keys, customers are charged for real.
