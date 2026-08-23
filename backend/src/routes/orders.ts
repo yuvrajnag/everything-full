@@ -11,6 +11,16 @@ import { PaymentProviderError } from '../services/payment/PaymentProvider';
 import { razorpayProvider } from '../services/payment/RazorpayPaymentProvider';
 import { razorpayConfigured } from '../config/env';
 import { serializeOrder } from '../serializers/order';
+import {
+  ORDER_DETAIL_INCLUDE,
+  AlreadyFinalizedError,
+  capturePayment,
+  commitReservedStock,
+  recordPaymentFailure,
+  sendOrderCancelledEmail,
+  sendOrderConfirmedEmail,
+  sendPaymentFailedEmail,
+} from '../services/orders/fulfillment';
 
 const router = Router();
 const paymentProvider = razorpayProvider;
@@ -280,6 +290,10 @@ router.post('/', requireUser, checkoutLimiter, async (req: Request, res: Respons
       });
 
       await finishIdempotency(idempotencyRedisKey, claimedIdempotency, order.id);
+
+      // COD never goes through the capture path, so confirm it here.
+      void sendOrderConfirmedEmail(confirmed);
+
       res.status(201).json(serializeOrder(confirmed));
       return;
     }
@@ -438,12 +452,10 @@ router.post('/:id/pay', requireUser, actionLimiter, async (req: Request, res: Re
     );
 
     if (!valid) {
-      await prisma.payment.update({
-        where: { id: payment.id },
-        data: {
-          status: PaymentStatus.FAILED,
-          failureReason: 'Signature verification failed',
-        },
+      await recordPaymentFailure({
+        orderId: order.id,
+        paymentRowId: payment.id,
+        reason: 'Signature verification failed',
       });
       res.status(400).json({
         error: 'We could not verify this payment. Your order has not been charged.',
@@ -452,48 +464,14 @@ router.post('/:id/pay', requireUser, actionLimiter, async (req: Request, res: Re
       return;
     }
 
-    // ─── Verified: commit stock and mark the order paid ────────────────
-    const updated = await prisma.$transaction(async (tx) => {
-      // Re-read inside the transaction so two concurrent confirmations of the
-      // same order cannot both decrement stock.
-      const fresh = await tx.order.findUnique({
-        where: { id: order.id },
-        select: { status: true },
-      });
-      if (fresh?.status !== OrderStatus.PENDING) {
-        throw new AlreadyFinalizedError();
-      }
-
-      await commitReservedStock(
-        tx,
-        order.items.map((i: any) => ({ variantId: i.variantId, quantity: i.quantity }))
-      );
-
-      await tx.payment.update({
-        where: { id: payment.id },
-        data: {
-          status: PaymentStatus.SUCCESS,
-          providerPaymentId: razorpay_payment_id,
-          failureReason: null,
-        },
-      });
-
-      await tx.auditLog.create({
-        data: {
-          action: 'PAYMENT_CAPTURED',
-          entityType: 'Order',
-          entityId: order.id,
-          orderId: order.id,
-          userId: order.userId,
-          details: JSON.stringify({ providerPaymentId: razorpay_payment_id, amount: payment.amount }),
-        },
-      });
-
-      return tx.order.update({
-        where: { id: order.id },
-        data: { status: OrderStatus.PAID },
-        include: ORDER_DETAIL_INCLUDE,
-      });
+    // ─── Verified: commit stock, mark paid and email — shared with the
+    // webhook path so the two can never diverge. Idempotent: if the webhook
+    // already captured this payment, `capturePayment` short-circuits.
+    const { order: updated } = await capturePayment({
+      orderId: order.id,
+      paymentRowId: payment.id,
+      providerPaymentId: razorpay_payment_id,
+      source: 'checkout',
     });
 
     res.json(serializeOrder(updated));
@@ -532,10 +510,13 @@ router.post('/:id/payment-failed', requireUser, actionLimiter, async (req: Reque
     const parsed = paymentFailedSchema.safeParse(req.body ?? {});
     const reason = (parsed.success && parsed.data.reason) || 'Payment was not completed';
 
-    await prisma.payment.updateMany({
-      where: { orderId: order.id, status: PaymentStatus.PENDING },
-      data: { status: PaymentStatus.FAILED, failureReason: reason.slice(0, 500) },
+    await recordPaymentFailure({ orderId: order.id, reason });
+
+    const full = await prisma.order.findUnique({
+      where: { id: order.id },
+      include: ORDER_DETAIL_INCLUDE,
     });
+    if (full) void sendPaymentFailedEmail(full, reason);
 
     // The order stays PENDING so the customer can retry from the order page;
     // the reservation is released by the stale-order sweep if they never do.
@@ -696,6 +677,9 @@ router.post('/:id/cancel', requireUser, actionLimiter, async (req: Request, res:
     });
 
     const refundedTotal = refunds.reduce((sum, r) => sum + r.amount, 0);
+
+    void sendOrderCancelledEmail(updated, refundedTotal);
+
     res.json({
       ...serializeOrder(updated),
       refund:
@@ -720,23 +704,10 @@ router.post('/:id/cancel', requireUser, actionLimiter, async (req: Request, res:
 // Helpers
 // ═══════════════════════════════════════════════════════════════════════
 
-export const ORDER_DETAIL_INCLUDE = {
-  items: { include: { variant: { include: { product: { include: { images: true } } } } } },
-  address: true,
-  payments: true,
-} satisfies Prisma.OrderInclude;
-
 class OutOfStockError extends Error {
   constructor(readonly productTitle: string, readonly variantId: string) {
     super(`Not enough stock for ${productTitle}`);
     this.name = 'OutOfStockError';
-  }
-}
-
-class AlreadyFinalizedError extends Error {
-  constructor() {
-    super('Order already finalized');
-    this.name = 'AlreadyFinalizedError';
   }
 }
 
@@ -833,22 +804,6 @@ async function recordRefunds(
       });
     }
   });
-}
-
-/** Turns a reservation into a real stock decrement. */
-async function commitReservedStock(
-  tx: Prisma.TransactionClient,
-  items: { variantId: string; quantity: number }[]
-) {
-  for (const item of items) {
-    await tx.inventory.update({
-      where: { variantId: item.variantId },
-      data: {
-        stockCount: { decrement: item.quantity },
-        reserved: { decrement: item.quantity },
-      },
-    });
-  }
 }
 
 /** Rolls back a reservation and voids the order after a failed payment init. */

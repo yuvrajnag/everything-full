@@ -1,3 +1,9 @@
+// Loads .env before the Prisma client reads DATABASE_URL. Without this,
+// `npm run seed` fails with "Environment variable not found: DATABASE_URL"
+// unless the caller happens to have exported it already.
+import dotenv from 'dotenv';
+dotenv.config();
+
 import { PrismaClient, Prisma } from '@prisma/client';
 
 const prisma = new PrismaClient();

@@ -55,19 +55,49 @@ export const env = {
   razorpay: {
     keyId: process.env.RAZORPAY_KEY_ID || '',
     keySecret: process.env.RAZORPAY_KEY_SECRET || '',
-    /** Optional: only needed if you wire up Razorpay webhooks. */
+    /** Signs webhook payloads. Set this in the Razorpay dashboard too. */
     webhookSecret: process.env.RAZORPAY_WEBHOOK_SECRET || '',
+  },
+
+  email: {
+    apiKey: process.env.EMAIL_API_KEY || '',
+    fromAddress: process.env.EMAIL_FROM_ADDRESS || '',
   },
 } as const;
 
 /** True when Razorpay credentials are present and online payments can be taken. */
 export const razorpayConfigured = Boolean(env.razorpay.keyId && env.razorpay.keySecret);
 
+/**
+ * True when webhook signatures can be verified. Without this the webhook
+ * endpoint rejects every delivery rather than trusting unverified payloads.
+ */
+export const razorpayWebhooksConfigured = Boolean(env.razorpay.webhookSecret);
+
+/** True when transactional email can actually be sent. */
+export const emailConfigured = Boolean(env.email.apiKey && env.email.fromAddress);
+
 if (!razorpayConfigured) {
   console.warn(
     '[WARN] RAZORPAY_KEY_ID / RAZORPAY_KEY_SECRET are not set. ' +
       'Card and UPI checkout will be rejected with a clear error; ' +
       'Cash on Delivery still works. See backend/.env.example.'
+  );
+}
+
+if (!razorpayWebhooksConfigured) {
+  console.warn(
+    '[WARN] RAZORPAY_WEBHOOK_SECRET is not set. POST /webhooks/razorpay will reject ' +
+      'every delivery, so payments captured after a customer closes their browser ' +
+      'will NOT be reconciled automatically. See backend/.env.example.'
+  );
+}
+
+if (!emailConfigured) {
+  console.warn(
+    '[WARN] EMAIL_API_KEY / EMAIL_FROM_ADDRESS are not set. Order confirmation, ' +
+      'cancellation and payment-failure emails will be logged but not sent. ' +
+      'See backend/.env.example.'
   );
 }
 

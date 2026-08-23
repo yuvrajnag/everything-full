@@ -13,6 +13,7 @@ import { OrderStatus, PaymentStatus } from '@prisma/client';
 
 import productRoutes from './routes/products';
 import orderRoutes from './routes/orders';
+import webhookRoutes from './routes/webhooks';
 import { prisma } from './db';
 import redis, { isRedisHealthy } from './lib/redis';
 
@@ -72,6 +73,13 @@ app.use(
     ],
   })
 );
+
+// ─── Webhooks ──────────────────────────────────────────────────────────
+// Mounted before express.json() and with a raw body parser: Razorpay's HMAC is
+// computed over the exact bytes it sent, and re-serialising a parsed object
+// changes key order and whitespace, so the signature would never match.
+// This is scoped to /webhooks only — every other route still gets JSON.
+app.use('/webhooks', express.raw({ type: 'application/json', limit: '1mb' }), webhookRoutes);
 
 app.use(express.json({ limit: '1mb' }));
 app.use(express.urlencoded({ extended: false, limit: '1mb' }));
@@ -180,25 +188,50 @@ async function progressOrders() {
  * Releases inventory held by checkouts the customer never completed.
  * Without this, every abandoned card/UPI checkout permanently removed those
  * units from sale.
+ *
+ * The hard requirement here is that this job must NEVER cancel an order the
+ * customer was actually charged for. A Razorpay webhook can land at any moment,
+ * including between this query and its transaction, so both the order status
+ * *and* the payment rows are re-checked inside the transaction. A payment that
+ * has reached SUCCESS — or that carries a provider payment id, meaning money
+ * moved even if our status write lost a race — vetoes the cancellation.
  */
 async function releaseStaleReservations() {
   const cutoff = new Date(Date.now() - RESERVATION_TTL_MS);
 
   const stale = await prisma.order.findMany({
     where: { status: OrderStatus.PENDING, createdAt: { lt: cutoff } },
-    include: { items: true },
+    select: { id: true },
     take: 50,
   });
 
-  for (const order of stale) {
+  for (const candidate of stale) {
     try {
-      await prisma.$transaction(async (tx) => {
-        // Re-check inside the transaction: the customer may have just paid.
-        const fresh = await tx.order.findUnique({
-          where: { id: order.id },
-          select: { status: true },
+      const outcome = await prisma.$transaction(async (tx) => {
+        // Re-read everything inside the transaction. Reading items here rather
+        // than in the outer query also guarantees the quantities we decrement
+        // are the ones committed at this instant.
+        const order = await tx.order.findUnique({
+          where: { id: candidate.id },
+          select: {
+            status: true,
+            items: { select: { variantId: true, quantity: true } },
+            payments: { select: { status: true, providerPaymentId: true } },
+          },
         });
-        if (fresh?.status !== OrderStatus.PENDING) return;
+
+        if (!order) return 'gone';
+
+        // The customer may have just paid through the browser handshake.
+        if (order.status !== OrderStatus.PENDING) return `status:${order.status}`;
+
+        // ...or a webhook may be mid-flight, or have captured the payment
+        // without our order status having been updated yet. Either way, money
+        // has moved and this order is not ours to cancel.
+        const captured = order.payments.find(
+          (p) => p.status === PaymentStatus.SUCCESS || p.providerPaymentId
+        );
+        if (captured) return 'payment-captured';
 
         for (const item of order.items) {
           await tx.inventory.update({
@@ -208,18 +241,30 @@ async function releaseStaleReservations() {
         }
 
         await tx.payment.updateMany({
-          where: { orderId: order.id, status: PaymentStatus.PENDING },
+          where: { orderId: candidate.id, status: PaymentStatus.PENDING },
           data: { status: PaymentStatus.FAILED, failureReason: 'Checkout abandoned' },
         });
 
         await tx.order.update({
-          where: { id: order.id },
+          where: { id: candidate.id },
           data: { status: OrderStatus.CANCELLED },
         });
+
+        return 'released';
       });
-      logger.info({ orderId: order.id }, 'Released stock from abandoned checkout');
+
+      if (outcome === 'released') {
+        logger.info({ orderId: candidate.id }, 'Released stock from abandoned checkout');
+      } else if (outcome === 'payment-captured') {
+        // Worth a warning: the order is past its reservation window but has a
+        // real payment against it, so something is lagging.
+        logger.warn(
+          { orderId: candidate.id },
+          'Stale PENDING order has a captured payment — left alone for reconciliation'
+        );
+      }
     } catch (err) {
-      logger.error({ err, orderId: order.id }, 'Failed to release stale reservation');
+      logger.error({ err, orderId: candidate.id }, 'Failed to release stale reservation');
     }
   }
 }
