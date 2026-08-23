@@ -1,151 +1,239 @@
 import { Router, Request, Response } from 'express';
-import { prisma } from '../db';
-import { OrderStatus } from '@prisma/client';
-import { MockPaymentProvider } from '../services/payment/MockPaymentProvider';
+import { OrderStatus, PaymentMethod, PaymentStatus, Prisma } from '@prisma/client';
 import { z } from 'zod';
 import rateLimit from 'express-rate-limit';
 import { RedisStore } from 'rate-limit-redis';
-import redis from '../lib/redis';
-import { requireInternalSecret } from '../middleware/auth';
-import * as crypto from 'crypto';
+
+import { prisma } from '../db';
+import redis, { isRedisHealthy, redisTry } from '../lib/redis';
+import { getAuthContext, requireInternalSecret, requireUser } from '../middleware/auth';
+import { PaymentProviderError } from '../services/payment/PaymentProvider';
+import { razorpayProvider } from '../services/payment/RazorpayPaymentProvider';
+import { razorpayConfigured } from '../config/env';
+import { serializeOrder } from '../serializers/order';
 
 const router = Router();
-const paymentProvider = new MockPaymentProvider();
+const paymentProvider = razorpayProvider;
 
 // ─── Rate limiters ─────────────────────────────────────────────────────
+const redisRateStore = () =>
+  new RedisStore({
+    sendCommand: (...args: string[]) => redis.call(args[0]!, ...args.slice(1)) as any,
+  });
+
 const checkoutLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 20,
-  store: new RedisStore({
-    sendCommand: (...args: string[]) => redis.call(args[0]!, ...args.slice(1)) as any,
-  }),
-  message: { error: 'Too many orders created, please try again later.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+  // Fall back to in-memory counting rather than failing the request outright
+  // when Redis is down.
+  ...(isRedisHealthy() ? { store: redisRateStore() } : {}),
+  message: { error: 'Too many orders created, please try again in a few minutes.', code: 'RATE_LIMITED' },
 });
 
 const actionLimiter = rateLimit({
   windowMs: 60 * 1000,
-  max: 10,
-  store: new RedisStore({
-    sendCommand: (...args: string[]) => redis.call(args[0]!, ...args.slice(1)) as any,
-  }),
-  message: { error: 'Too many requests, please try again later.' },
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  ...(isRedisHealthy() ? { store: redisRateStore() } : {}),
+  message: { error: 'Too many requests, please try again in a moment.', code: 'RATE_LIMITED' },
 });
 
-// ─── All order routes require the internal secret ──────────────────────
+// ─── All order routes require the internal secret and a signed-in user ──
 router.use(requireInternalSecret);
 
 // ─── Zod schemas ───────────────────────────────────────────────────────
 const shippingAddressSchema = z.object({
-  email: z.string().email().max(255),
-  firstName: z.string().min(1).max(100),
-  lastName: z.string().min(1).max(100),
-  address: z.string().min(1).max(500),
-  city: z.string().min(1).max(100),
-  state: z.string().min(1).max(100),
-  pinCode: z.string().regex(/^\d{6}$/),
-  phone: z.string().regex(/^\d{10}$/),
-  country: z.string().min(1).max(100),
+  email: z.string().trim().email('Enter a valid email address.').max(255),
+  firstName: z.string().trim().min(1, 'First name is required.').max(100),
+  lastName: z.string().trim().min(1, 'Last name is required.').max(100),
+  address: z.string().trim().min(1, 'Address is required.').max(500),
+  city: z.string().trim().min(1, 'City is required.').max(100),
+  state: z.string().trim().min(1, 'State is required.').max(100),
+  pinCode: z.string().trim().regex(/^\d{6}$/, 'PIN code must be 6 digits.'),
+  phone: z.string().trim().regex(/^\d{10}$/, 'Phone number must be 10 digits.'),
+  country: z.string().trim().min(1).max(100),
 });
 
-const orderSchema = z.object({
-  items: z.array(z.object({
-    productId: z.string().min(1).max(100),
-    quantity: z.number().int().positive().max(10),
-  })).min(1).max(20),
-  paymentMethod: z.enum(['card', 'upi', 'cod']),
-  shippingAddress: shippingAddressSchema,
-  // Client-sent values we explicitly ignore for pricing (defense in depth)
-  totalAmount: z.any().optional(),
-  priceAtPurchase: z.any().optional(),
-}).strict();
+const orderSchema = z
+  .object({
+    items: z
+      .array(
+        z.object({
+          productId: z.string().min(1).max(100),
+          /** Optional: pins the exact configuration the customer chose. */
+          variantId: z.string().min(1).max(100).nullish(),
+          quantity: z.number().int().positive().max(10),
+        })
+      )
+      .min(1, 'Your cart is empty.')
+      .max(20),
+    paymentMethod: z.enum(['card', 'upi', 'cod']),
+    shippingAddress: shippingAddressSchema,
+    // Client-sent values we explicitly ignore for pricing (defense in depth).
+    totalAmount: z.any().optional(),
+    priceAtPurchase: z.any().optional(),
+  })
+  .strict();
 
+const paySchema = z.object({
+  razorpay_order_id: z.string().min(1).max(200),
+  razorpay_payment_id: z.string().min(1).max(200),
+  razorpay_signature: z.string().min(1).max(500),
+});
 
+const paymentFailedSchema = z.object({
+  /** Customer-safe description from the provider's checkout widget. */
+  reason: z.string().max(500).optional(),
+  code: z.string().max(100).optional(),
+});
 
-// ─── POST /  — Create order ───────────────────────────────────────────
-router.post('/', checkoutLimiter, async (req: Request, res: Response) => {
+const PAYMENT_METHOD_MAP: Record<'card' | 'upi' | 'cod', PaymentMethod> = {
+  card: PaymentMethod.CARD,
+  upi: PaymentMethod.UPI,
+  cod: PaymentMethod.COD,
+};
+
+const ORDER_ID_MAX = 50;
+
+/** Statuses from which a customer may still cancel. */
+const CANCELLABLE: OrderStatus[] = [OrderStatus.PENDING, OrderStatus.PAID, OrderStatus.CONFIRMED];
+
+function isValidOrderId(id: unknown): id is string {
+  return typeof id === 'string' && id.length > 0 && id.length <= ORDER_ID_MAX;
+}
+
+/**
+ * Loads an order and checks the caller is allowed to see it.
+ * Returns null after having written the response when access is denied.
+ */
+async function loadAuthorizedOrder(
+  req: Request,
+  res: Response,
+  include: Prisma.OrderInclude
+): Promise<any | null> {
+  const orderId: unknown = req.params.id;
+  if (!isValidOrderId(orderId)) {
+    res.status(400).json({ error: 'Invalid order ID', code: 'INVALID_ORDER_ID' });
+    return null;
+  }
+
+  const order = await prisma.order.findUnique({ where: { id: orderId }, include });
+  if (!order) {
+    res.status(404).json({ error: 'Order not found', code: 'ORDER_NOT_FOUND' });
+    return null;
+  }
+
+  const { userId, isAdmin } = getAuthContext(req);
+  if (!isAdmin && order.userId !== userId) {
+    // Don't confirm the order exists to someone who isn't allowed to see it.
+    res.status(404).json({ error: 'Order not found', code: 'ORDER_NOT_FOUND' });
+    return null;
+  }
+
+  return order;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// POST /  — Create order
+// ═══════════════════════════════════════════════════════════════════════
+router.post('/', requireUser, checkoutLimiter, async (req: Request, res: Response) => {
+  const { userId } = getAuthContext(req);
+
+  const parsed = orderSchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({
+      error: firstZodMessage(parsed.error) ?? 'Please check the details you entered.',
+      code: 'INVALID_INPUT',
+      details: parsed.error.flatten(),
+    });
+    return;
+  }
+
+  const { items, paymentMethod, shippingAddress } = parsed.data;
+
+  if (paymentMethod !== 'cod' && !razorpayConfigured) {
+    res.status(503).json({
+      error:
+        'Online payments are temporarily unavailable. Please choose Cash on Delivery, or try again later.',
+      code: 'PAYMENTS_UNAVAILABLE',
+    });
+    return;
+  }
+
+  // ─── Idempotency: claim the key *before* doing any work ──────────────
+  // Two rapid submissions of the same checkout share a key; the loser waits
+  // for the winner's order rather than creating a second one.
+  const idempotencyKey = readIdempotencyKey(req);
+  const idempotencyRedisKey = idempotencyKey ? `idempotency:${userId}:${idempotencyKey}` : null;
+  let claimedIdempotency = false;
+
+  if (idempotencyRedisKey) {
+    const existing = await resolveIdempotentOrder(idempotencyRedisKey);
+    if (existing === 'in-flight') {
+      res.status(409).json({
+        error: 'This order is already being placed. Please wait a moment.',
+        code: 'ORDER_IN_FLIGHT',
+      });
+      return;
+    }
+    if (existing) {
+      const order = await prisma.order.findUnique({
+        where: { id: existing },
+        include: ORDER_DETAIL_INCLUDE,
+      });
+      if (order) {
+        res.status(200).json(serializeOrder(order));
+        return;
+      }
+    }
+    // `NX` claim: only one concurrent request wins.
+    const claim = await redisTry(
+      (c) => c.set(idempotencyRedisKey, 'in-flight', 'EX', 24 * 60 * 60, 'NX'),
+      null
+    );
+    if (claim === null && isRedisHealthy()) {
+      res.status(409).json({
+        error: 'This order is already being placed. Please wait a moment.',
+        code: 'ORDER_IN_FLIGHT',
+      });
+      return;
+    }
+    claimedIdempotency = true;
+  }
+
+  let orderId: string | null = null;
+
   try {
-    // Validate request body
-    const parsed = orderSchema.safeParse(req.body);
-    if (!parsed.success) {
-      res.status(400).json({ error: 'Invalid input', details: parsed.error.flatten() });
+    // ─── Resolve variants and price the order server-side ──────────────
+    const priced = await priceItems(items);
+    if ('error' in priced) {
+      res.status(priced.status).json(priced.error);
       return;
     }
-    const { items, paymentMethod, shippingAddress } = parsed.data;
-    const userId = req.headers['x-user-id'] as string | undefined;
+    const { orderItemsData, calculatedTotal } = priced;
 
-    if (!userId) {
-      res.status(401).json({ error: 'Unauthorized: Login required to place orders' });
-      return;
-    }
-
-    // ─── Idempotency check ───────────────────────────────────────────
-    const idempotencyKey = req.headers['x-idempotency-key'] as string | undefined;
-    if (idempotencyKey) {
-      const existingOrderId = await redis.get(`idempotency:${idempotencyKey}`);
-      if (existingOrderId) {
-        // Return the existing order
-        const existingOrder = await prisma.order.findUnique({
-          where: { id: existingOrderId },
-          include: { items: true, address: true },
-        });
-        if (existingOrder) {
-          res.json(existingOrder);
-          return;
-        }
-      }
-    }
-
-    // ─── Server-side price calculation ───────────────────────────────
-    let calculatedTotal = 0;
-    const orderItemsData: { variantId: string; quantity: number; priceAtPurchase: number }[] = [];
-
-    for (const item of items) {
-      const product = await prisma.product.findUnique({
-        where: { id: item.productId },
-        include: { variants: { include: { inventory: true } } },
-      });
-
-      if (!product || product.variants.length === 0) {
-        res.status(400).json({ error: `Product ${item.productId} not found or missing variants` });
-        return;
-      }
-
-      const defaultVariant = product.variants[0];
-      if (!defaultVariant) {
-        res.status(400).json({ error: 'Product variant not found' });
-        return;
-      }
-
-      const itemPrice = defaultVariant.price;
-      calculatedTotal += itemPrice * item.quantity;
-
-      orderItemsData.push({
-        variantId: defaultVariant.id,
-        quantity: item.quantity,
-        priceAtPurchase: itemPrice,
-      });
-    }
-
-    // ─── Atomic transaction: reserve inventory + create order ─────────
+    // ─── Reserve stock + create the order in one transaction ───────────
     const order = await prisma.$transaction(async (tx) => {
-      // Reserve inventory atomically
       for (const item of orderItemsData) {
-        const result = await tx.$executeRaw`
-          UPDATE "Inventory" 
+        // Conditional UPDATE: the WHERE clause is the stock check, so two
+        // concurrent buyers of the last unit cannot both succeed.
+        const updated = await tx.$executeRaw`
+          UPDATE "Inventory"
           SET "reserved" = "reserved" + ${item.quantity}
-          WHERE "variantId" = ${item.variantId} 
-          AND ("stockCount" - "reserved") >= ${item.quantity}
+          WHERE "variantId" = ${item.variantId}
+            AND ("stockCount" - "reserved") >= ${item.quantity}
         `;
-
-        if (result === 0) {
-          throw new Error(`Not enough stock for variant ${item.variantId}`);
+        if (updated === 0) {
+          throw new OutOfStockError(item.title, item.variantId);
         }
       }
 
-      // Create Address
       const address = await tx.address.create({
         data: {
-          userId: userId,
+          userId: userId!,
           email: shippingAddress.email,
           firstName: shippingAddress.firstName,
           lastName: shippingAddress.lastName,
@@ -158,295 +246,616 @@ router.post('/', checkoutLimiter, async (req: Request, res: Response) => {
         },
       });
 
-      // Create Order
-      const newOrder = await tx.order.create({
+      return tx.order.create({
         data: {
           totalAmount: calculatedTotal,
-          status: 'PENDING',
-          userId: userId,
+          status: OrderStatus.PENDING,
+          paymentMethod: PAYMENT_METHOD_MAP[paymentMethod],
+          userId: userId!,
           addressId: address.id,
-          items: { create: orderItemsData },
+          items: {
+            create: orderItemsData.map((i) => ({
+              variantId: i.variantId,
+              quantity: i.quantity,
+              priceAtPurchase: i.priceAtPurchase,
+            })),
+          },
         },
-        include: { items: true, address: true },
+        include: ORDER_DETAIL_INCLUDE,
       });
-
-      return newOrder;
     });
 
-    // ─── Store idempotency key ───────────────────────────────────────
-    if (idempotencyKey) {
-      // 24 hour TTL
-      await redis.setex(`idempotency:${idempotencyKey}`, 24 * 60 * 60, order.id);
-    }
+    orderId = order.id;
 
-    // ─── Initialize Payment ──────────────────────────────────────────
-    const payment = await paymentProvider.createOrder(calculatedTotal, 'INR', order.id);
-
-    await prisma.payment.create({
-      data: {
-        orderId: order.id,
-        provider: 'MOCK',
-        providerOrderId: payment.id,
-        amount: calculatedTotal,
-        status: 'PENDING',
-      },
-    });
-
-    // Auto-confirm for COD/Card
-    if (paymentMethod === 'cod' || paymentMethod === 'card') {
-      await prisma.order.update({
-        where: { id: order.id },
-        data: { status: OrderStatus.PAID },
+    if (paymentMethod === 'cod') {
+      // Cash on Delivery: nothing to charge now. Commit the stock so the units
+      // are genuinely allocated, and confirm the order.
+      const confirmed = await prisma.$transaction(async (tx) => {
+        await commitReservedStock(tx, orderItemsData);
+        return tx.order.update({
+          where: { id: order.id },
+          data: { status: OrderStatus.CONFIRMED },
+          include: ORDER_DETAIL_INCLUDE,
+        });
       });
-    }
 
-    res.status(201).json(order);
-  } catch (error: any) {
-    console.error(`[ERROR] Order creation: ${error.message}`);
-    res.status(400).json({ error: 'Failed to create order', details: error.message });
-  }
-});
-
-// ─── GET /  — List orders ─────────────────────────────────────────────
-router.get('/', async (req: Request, res: Response) => {
-  try {
-    const userId = req.headers['x-user-id'] as string;
-    const role = req.headers['x-user-role'] as string;
-
-    if (!userId && role !== 'ADMIN' && role !== 'SUPER_ADMIN') {
-      res.status(401).json({ error: 'Unauthorized' });
+      await finishIdempotency(idempotencyRedisKey, claimedIdempotency, order.id);
+      res.status(201).json(serializeOrder(confirmed));
       return;
     }
 
-    const where = (role === 'ADMIN' || role === 'SUPER_ADMIN') ? {} : { userId };
+    // ─── Online payment: open an order with the provider ───────────────
+    // If this fails the customer must not be left with a PENDING order
+    // silently holding stock, so the reservation is rolled back.
+    let providerOrder;
+    try {
+      providerOrder = await paymentProvider.createOrder(calculatedTotal, 'INR', order.id);
+    } catch (err) {
+      await releaseOrder(order.id, orderItemsData).catch((e) =>
+        console.error('[ERROR] Failed to release stock after payment init failure:', e)
+      );
+      await clearIdempotency(idempotencyRedisKey, claimedIdempotency);
+
+      const message =
+        err instanceof PaymentProviderError
+          ? err.message
+          : 'We could not start the payment. Please try again.';
+      console.error('[ERROR] Payment init failed:', err);
+      res.status(502).json({ error: message, code: 'PAYMENT_INIT_FAILED' });
+      return;
+    }
+
+    const payment = await prisma.payment.create({
+      data: {
+        orderId: order.id,
+        provider: paymentProvider.name,
+        providerOrderId: providerOrder.id,
+        amount: calculatedTotal,
+        status: PaymentStatus.PENDING,
+      },
+    });
+
+    await finishIdempotency(idempotencyRedisKey, claimedIdempotency, order.id);
+
+    res.status(201).json({
+      ...serializeOrder({ ...order, payments: [payment] }),
+      // Everything the browser needs to open the provider's checkout widget.
+      payment: {
+        provider: paymentProvider.name,
+        providerOrderId: providerOrder.id,
+        amount: providerOrder.amount,
+        currency: providerOrder.currency,
+      },
+    });
+  } catch (error: any) {
+    await clearIdempotency(idempotencyRedisKey, claimedIdempotency);
+
+    if (error instanceof OutOfStockError) {
+      res.status(409).json({
+        error: `${error.productTitle} just sold out or does not have enough stock left. Please adjust your cart and try again.`,
+        code: 'OUT_OF_STOCK',
+        variantId: error.variantId,
+      });
+      return;
+    }
+
+    console.error('[ERROR] Order creation:', error);
+    res.status(500).json({
+      error: 'We could not place your order. No payment has been taken — please try again.',
+      code: 'ORDER_CREATE_FAILED',
+    });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// GET /  — List orders (own orders, or all orders for an admin)
+// ═══════════════════════════════════════════════════════════════════════
+router.get('/', requireUser, async (req: Request, res: Response) => {
+  try {
+    const { userId, isAdmin } = getAuthContext(req);
+    const where: Prisma.OrderWhereInput = isAdmin ? {} : { userId: userId! };
 
     const orders = await prisma.order.findMany({
       where,
       orderBy: { createdAt: 'desc' },
-      include: {
-        items: { include: { variant: { include: { product: { include: { images: true } } } } } },
-        address: true,
-        user: true,
-      },
+      take: 100,
+      include: ORDER_DETAIL_INCLUDE,
     });
 
-    const mapped = orders.map((o) => ({
-      id: o.id,
-      status: o.status,
-      totalAmount: o.totalAmount,
-      createdAt: o.createdAt,
-      items: o.items.map((i) => ({
-        id: i.id,
-        product: {
-          title: i.variant.product.title,
-          imageUrl: i.variant.product.images[0]?.url || '',
-        },
-        quantity: i.quantity,
-        priceAtPurchase: i.priceAtPurchase,
-      })),
-      shippingAddress: {
-        ...o.address,
-        email: o.address?.email || o.user?.email || null,
-      },
-    }));
-
-    res.json(mapped);
+    res.json(orders.map((o) => serializeOrder(o)));
   } catch (error) {
     console.error('[ERROR] Fetch orders:', error);
-    res.status(500).json({ error: 'Failed to fetch orders' });
+    res.status(500).json({ error: 'Could not load your orders.', code: 'ORDERS_FETCH_FAILED' });
   }
 });
 
-// ─── GET /:id  — Get single order ─────────────────────────────────────
-router.get('/:id', async (req: Request, res: Response) => {
+// ═══════════════════════════════════════════════════════════════════════
+// GET /:id  — Single order
+// ═══════════════════════════════════════════════════════════════════════
+router.get('/:id', requireUser, async (req: Request, res: Response) => {
   try {
-    const orderId = req.params.id as string;
-    if (!orderId || orderId.length > 50) {
-      res.status(400).json({ error: 'Invalid order ID' });
-      return;
-    }
-
-    const order = await prisma.order.findUnique({
-      where: { id: orderId },
-      include: {
-        items: { include: { variant: { include: { product: { include: { images: true } } } } } },
-        address: true,
-        user: true,
-      },
-    });
-
-    if (!order) {
-      res.status(404).json({ error: 'Order not found' });
-      return;
-    }
-
-    // IDOR Protection
-    const userId = req.headers['x-user-id'] as string;
-    const role = req.headers['x-user-role'] as string;
-    if (order.userId && order.userId !== userId && role !== 'ADMIN' && role !== 'SUPER_ADMIN') {
-      res.status(403).json({ error: 'Forbidden' });
-      return;
-    }
-
-    res.json({
-      id: order.id,
-      status: order.status,
-      totalAmount: order.totalAmount,
-      createdAt: order.createdAt,
-      items: order.items.map((i) => ({
-        id: i.id,
-        product: {
-          title: i.variant.product.title,
-          imageUrl: i.variant.product.images[0]?.url || '',
-        },
-        quantity: i.quantity,
-        priceAtPurchase: i.priceAtPurchase,
-      })),
-      shippingAddress: {
-        ...order.address,
-        email: order.address?.email || order.user?.email || null,
-      },
-    });
+    const order = await loadAuthorizedOrder(req, res, ORDER_DETAIL_INCLUDE);
+    if (!order) return;
+    res.json(serializeOrder(order));
   } catch (error) {
     console.error('[ERROR] Fetch order:', error);
-    res.status(500).json({ error: 'Failed to fetch order' });
+    res.status(500).json({ error: 'Could not load this order.', code: 'ORDER_FETCH_FAILED' });
   }
 });
 
-// ─── POST /:id/pay  — Verify payment ─────────────────────────────────
-router.post('/:id/pay', actionLimiter, async (req: Request, res: Response) => {
+// ═══════════════════════════════════════════════════════════════════════
+// POST /:id/pay  — Verify a completed provider payment
+// ═══════════════════════════════════════════════════════════════════════
+router.post('/:id/pay', requireUser, actionLimiter, async (req: Request, res: Response) => {
   try {
-    const orderId = req.params.id as string;
-    if (!orderId || orderId.length > 50) {
-      res.status(400).json({ error: 'Invalid order ID' });
+    const order = await loadAuthorizedOrder(req, res, { items: true, payments: true });
+    if (!order) return;
+
+    // Idempotent: replaying the handshake on an already-paid order is a no-op.
+    if (order.status === OrderStatus.PAID) {
+      const full = await prisma.order.findUnique({
+        where: { id: order.id },
+        include: ORDER_DETAIL_INCLUDE,
+      });
+      res.json(serializeOrder(full!));
       return;
     }
 
-    const { signature } = req.body;
-    const isValid = await paymentProvider.verifyPayment({}, signature || 'mock_valid_signature');
-
-    if (!isValid) {
-      res.status(400).json({ error: 'Invalid payment signature' });
+    if (order.status !== OrderStatus.PENDING) {
+      res.status(409).json({
+        error: `This order can no longer be paid for (status: ${order.status}).`,
+        code: 'ORDER_NOT_PAYABLE',
+      });
       return;
     }
 
-    // Idempotency: verify order isn't already paid
-    const currentOrder = await prisma.order.findUnique({
-      where: { id: orderId },
-      include: { items: true, payments: true },
-    }) as any;
+    const parsed = paySchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({
+        error: 'The payment confirmation was incomplete. If you were charged, contact support and we will resolve it.',
+        code: 'INVALID_PAYMENT_PAYLOAD',
+      });
+      return;
+    }
+    const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = parsed.data;
 
-    if (!currentOrder) {
-      res.status(404).json({ error: 'Order not found' });
+    const payment = order.payments.find(
+      (p: any) => p.providerOrderId === razorpay_order_id
+    );
+    if (!payment) {
+      // The provider order id must belong to *this* order — otherwise a
+      // customer could pay ₹1 on one order and replay it against another.
+      res.status(400).json({
+        error: 'This payment does not belong to this order.',
+        code: 'PAYMENT_ORDER_MISMATCH',
+      });
       return;
     }
 
-    if (currentOrder.status === OrderStatus.PAID) {
-      res.json(currentOrder); // Idempotent return
+    const valid = await paymentProvider.verifyPayment(
+      { orderId: razorpay_order_id, paymentId: razorpay_payment_id },
+      razorpay_signature
+    );
+
+    if (!valid) {
+      await prisma.payment.update({
+        where: { id: payment.id },
+        data: {
+          status: PaymentStatus.FAILED,
+          failureReason: 'Signature verification failed',
+        },
+      });
+      res.status(400).json({
+        error: 'We could not verify this payment. Your order has not been charged.',
+        code: 'PAYMENT_VERIFICATION_FAILED',
+      });
       return;
     }
 
-    // Atomic: finalize inventory + mark PAID
-    const order = await prisma.$transaction(async (tx) => {
-      for (const item of currentOrder.items) {
-        await tx.inventory.update({
-          where: { variantId: item.variantId },
-          data: {
-            stockCount: { decrement: item.quantity },
-            reserved: { decrement: item.quantity },
-          },
-        });
+    // ─── Verified: commit stock and mark the order paid ────────────────
+    const updated = await prisma.$transaction(async (tx) => {
+      // Re-read inside the transaction so two concurrent confirmations of the
+      // same order cannot both decrement stock.
+      const fresh = await tx.order.findUnique({
+        where: { id: order.id },
+        select: { status: true },
+      });
+      if (fresh?.status !== OrderStatus.PENDING) {
+        throw new AlreadyFinalizedError();
       }
 
-      await tx.payment.updateMany({
-        where: { orderId: currentOrder.id },
-        data: { status: 'SUCCESS' },
+      await commitReservedStock(
+        tx,
+        order.items.map((i: any) => ({ variantId: i.variantId, quantity: i.quantity }))
+      );
+
+      await tx.payment.update({
+        where: { id: payment.id },
+        data: {
+          status: PaymentStatus.SUCCESS,
+          providerPaymentId: razorpay_payment_id,
+          failureReason: null,
+        },
       });
 
-      return await tx.order.update({
-        where: { id: currentOrder.id },
+      await tx.auditLog.create({
+        data: {
+          action: 'PAYMENT_CAPTURED',
+          entityType: 'Order',
+          entityId: order.id,
+          orderId: order.id,
+          userId: order.userId,
+          details: JSON.stringify({ providerPaymentId: razorpay_payment_id, amount: payment.amount }),
+        },
+      });
+
+      return tx.order.update({
+        where: { id: order.id },
         data: { status: OrderStatus.PAID },
+        include: ORDER_DETAIL_INCLUDE,
       });
     });
 
-    res.json(order);
+    res.json(serializeOrder(updated));
   } catch (error) {
-    console.error('[ERROR] Payment:', error);
-    res.status(500).json({ error: 'Failed to process payment' });
+    if (error instanceof AlreadyFinalizedError) {
+      const full = await prisma.order.findUnique({
+        where: { id: String(req.params.id) },
+        include: ORDER_DETAIL_INCLUDE,
+      });
+      if (full) {
+        res.json(serializeOrder(full));
+        return;
+      }
+    }
+    console.error('[ERROR] Payment verification:', error);
+    res.status(500).json({
+      error: 'We could not confirm your payment. If you were charged, contact support and we will resolve it.',
+      code: 'PAYMENT_CONFIRM_FAILED',
+    });
   }
 });
 
-// ─── POST /:id/cancel  — Cancel order ────────────────────────────────
-router.post('/:id/cancel', actionLimiter, async (req: Request, res: Response) => {
+// ═══════════════════════════════════════════════════════════════════════
+// POST /:id/payment-failed  — Record a declined/abandoned payment
+// ═══════════════════════════════════════════════════════════════════════
+router.post('/:id/payment-failed', requireUser, actionLimiter, async (req: Request, res: Response) => {
   try {
-    const orderId = req.params.id as string;
-    if (!orderId || orderId.length > 50) {
-      res.status(400).json({ error: 'Invalid order ID' });
+    const order = await loadAuthorizedOrder(req, res, { items: true, payments: true });
+    if (!order) return;
+
+    if (order.status !== OrderStatus.PENDING) {
+      res.json({ recorded: false, status: order.status });
       return;
     }
 
-    const order = await prisma.order.findUnique({
-      where: { id: orderId },
-      include: { items: true },
-    }) as any;
+    const parsed = paymentFailedSchema.safeParse(req.body ?? {});
+    const reason = (parsed.success && parsed.data.reason) || 'Payment was not completed';
 
-    if (!order) {
-      res.status(404).json({ error: 'Order not found' });
+    await prisma.payment.updateMany({
+      where: { orderId: order.id, status: PaymentStatus.PENDING },
+      data: { status: PaymentStatus.FAILED, failureReason: reason.slice(0, 500) },
+    });
+
+    // The order stays PENDING so the customer can retry from the order page;
+    // the reservation is released by the stale-order sweep if they never do.
+    res.json({ recorded: true, status: order.status });
+  } catch (error) {
+    console.error('[ERROR] Recording payment failure:', error);
+    res.status(500).json({ error: 'Could not record the payment failure.', code: 'RECORD_FAILED' });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// POST /:id/cancel  — Cancel an order, refunding any captured payment
+// ═══════════════════════════════════════════════════════════════════════
+router.post('/:id/cancel', requireUser, actionLimiter, async (req: Request, res: Response) => {
+  try {
+    const order = await loadAuthorizedOrder(req, res, { items: true, payments: true });
+    if (!order) return;
+
+    // Idempotent.
+    if (order.status === OrderStatus.CANCELLED || order.status === OrderStatus.REFUNDED) {
+      const full = await prisma.order.findUnique({
+        where: { id: order.id },
+        include: ORDER_DETAIL_INCLUDE,
+      });
+      res.json(serializeOrder(full!));
       return;
     }
 
-    // IDOR Protection
-    const userId = req.headers['x-user-id'] as string;
-    const role = req.headers['x-user-role'] as string;
-    if (order.userId && order.userId !== userId && role !== 'ADMIN' && role !== 'SUPER_ADMIN') {
-      res.status(403).json({ error: 'Forbidden' });
+    if (!CANCELLABLE.includes(order.status)) {
+      res.status(409).json({
+        error:
+          order.status === OrderStatus.SHIPPED || order.status === OrderStatus.DELIVERED
+            ? 'This order has already shipped and can no longer be cancelled. You can start a return instead.'
+            : `This order cannot be cancelled (status: ${order.status}).`,
+        code: 'ORDER_NOT_CANCELLABLE',
+      });
       return;
     }
 
-    // Idempotent
-    if (order.status === OrderStatus.CANCELLED) {
-      res.json(order);
+    // ─── Refund any money we actually took, before cancelling anything ──
+    // A captured payment is one that reached SUCCESS and carries a provider
+    // payment id. COD orders have no captured payment, so nothing is refunded.
+    const capturedPayment = order.payments.find(
+      (p: any) => p.status === PaymentStatus.SUCCESS && p.providerPaymentId
+    );
+
+    let refund: { id: string; status: string; amount: number } | null = null;
+
+    if (capturedPayment) {
+      try {
+        refund = await paymentProvider.refundPayment(
+          capturedPayment.providerPaymentId,
+          capturedPayment.amount - capturedPayment.refundedAmount
+        );
+      } catch (err) {
+        // Hard fail: never mark an order cancelled when the customer's money
+        // has not actually been returned.
+        console.error('[ERROR] Refund failed, cancellation aborted:', err);
+        const message =
+          err instanceof PaymentProviderError
+            ? `We could not issue your refund: ${err.message} Your order has not been cancelled — please try again or contact support.`
+            : 'We could not issue your refund, so the order has not been cancelled. Please try again or contact support.';
+        res.status(502).json({ error: message, code: 'REFUND_FAILED' });
+        return;
+      }
+    } else if (order.status === OrderStatus.PAID) {
+      // The order says PAID but no captured payment is on file. Cancelling here
+      // would silently swallow a real charge, so refuse and surface it.
+      console.error(`[ERROR] Order ${order.id} is PAID with no captured payment record.`);
+      res.status(409).json({
+        error:
+          'We could not locate the payment for this order, so it cannot be cancelled automatically. Please contact support and we will sort it out.',
+        code: 'PAYMENT_RECORD_MISSING',
+      });
       return;
     }
 
-    if (order.status === OrderStatus.SHIPPED || order.status === OrderStatus.DELIVERED) {
-      res.status(400).json({ error: 'Cannot cancel shipped or delivered orders' });
-      return;
-    }
+    // ─── Money is back: release stock and cancel ────────────────────────
+    const updated = await prisma.$transaction(async (tx) => {
+      const fresh = await tx.order.findUnique({
+        where: { id: order.id },
+        select: { status: true },
+      });
+      if (!fresh || !CANCELLABLE.includes(fresh.status)) {
+        throw new AlreadyFinalizedError();
+      }
 
-    const updatedOrder = await prisma.$transaction(async (tx) => {
       for (const item of order.items) {
-        if (order.status === OrderStatus.PAID) {
-          // Paid: add back to stockCount
-          await tx.inventory.update({
-            where: { variantId: item.variantId },
-            data: { stockCount: { increment: item.quantity } },
-          });
-        } else {
-          // Pending: release reserved stock
+        if (fresh.status === OrderStatus.PENDING) {
+          // Never charged: the units are still only reserved.
           await tx.inventory.update({
             where: { variantId: item.variantId },
             data: { reserved: { decrement: item.quantity } },
           });
+        } else {
+          // Paid or COD-confirmed: stock was committed, so put it back.
+          await tx.inventory.update({
+            where: { variantId: item.variantId },
+            data: { stockCount: { increment: item.quantity } },
+          });
         }
       }
 
+      if (capturedPayment && refund) {
+        await tx.payment.update({
+          where: { id: capturedPayment.id },
+          data: {
+            status: PaymentStatus.REFUNDED,
+            providerRefundId: refund.id,
+            refundedAmount: refund.amount,
+          },
+        });
+      }
+
+      // Any payment that never completed is closed out as failed.
       await tx.payment.updateMany({
-        where: { orderId: order.id },
-        data: { status: 'REFUNDED' },
+        where: { orderId: order.id, status: PaymentStatus.PENDING },
+        data: { status: PaymentStatus.FAILED, failureReason: 'Order cancelled before payment' },
       });
 
-      return await tx.order.update({
+      await tx.auditLog.create({
+        data: {
+          action: 'ORDER_CANCELLED',
+          entityType: 'Order',
+          entityId: order.id,
+          orderId: order.id,
+          userId: order.userId,
+          details: JSON.stringify({
+            previousStatus: fresh.status,
+            refundId: refund?.id ?? null,
+            refundedAmount: refund?.amount ?? 0,
+          }),
+        },
+      });
+
+      return tx.order.update({
         where: { id: order.id },
         data: { status: OrderStatus.CANCELLED },
+        include: ORDER_DETAIL_INCLUDE,
       });
     });
 
-    res.json(updatedOrder);
+    res.json({
+      ...serializeOrder(updated),
+      refund: refund
+        ? { id: refund.id, status: refund.status, amount: refund.amount }
+        : null,
+    });
   } catch (error) {
+    if (error instanceof AlreadyFinalizedError) {
+      res.status(409).json({
+        error: 'This order was just updated elsewhere. Refresh to see its current status.',
+        code: 'ORDER_CHANGED',
+      });
+      return;
+    }
     console.error('[ERROR] Cancel order:', error);
-    res.status(500).json({ error: 'Failed to cancel order' });
+    res.status(500).json({ error: 'Could not cancel this order.', code: 'ORDER_CANCEL_FAILED' });
   }
 });
+
+// ═══════════════════════════════════════════════════════════════════════
+// Helpers
+// ═══════════════════════════════════════════════════════════════════════
+
+export const ORDER_DETAIL_INCLUDE = {
+  items: { include: { variant: { include: { product: { include: { images: true } } } } } },
+  address: true,
+  payments: true,
+} satisfies Prisma.OrderInclude;
+
+class OutOfStockError extends Error {
+  constructor(readonly productTitle: string, readonly variantId: string) {
+    super(`Not enough stock for ${productTitle}`);
+    this.name = 'OutOfStockError';
+  }
+}
+
+class AlreadyFinalizedError extends Error {
+  constructor() {
+    super('Order already finalized');
+    this.name = 'AlreadyFinalizedError';
+  }
+}
+
+interface PricedItem {
+  variantId: string;
+  quantity: number;
+  priceAtPurchase: number;
+  title: string;
+}
+
+/**
+ * Resolves each requested item to a concrete variant and prices it from the
+ * database. Client-sent prices are never trusted.
+ */
+async function priceItems(
+  items: { productId: string; variantId?: string | null | undefined; quantity: number }[]
+): Promise<{ orderItemsData: PricedItem[]; calculatedTotal: number } | { status: number; error: any }> {
+  const orderItemsData: PricedItem[] = [];
+  let calculatedTotal = 0;
+
+  for (const item of items) {
+    const product = await prisma.product.findUnique({
+      where: { id: item.productId },
+      include: { variants: { orderBy: { price: 'asc' } } },
+    });
+
+    if (!product || product.variants.length === 0) {
+      return {
+        status: 400,
+        error: {
+          error: 'One of the items in your cart is no longer available. Please remove it and try again.',
+          code: 'PRODUCT_UNAVAILABLE',
+          productId: item.productId,
+        },
+      };
+    }
+
+    let variant = item.variantId
+      ? product.variants.find((v) => v.id === item.variantId)
+      : product.variants.find((v) => v.isDefault) ?? product.variants[0];
+
+    if (!variant) {
+      return {
+        status: 400,
+        error: {
+          error: `The selected option for ${product.title} is no longer available. Please pick another and try again.`,
+          code: 'VARIANT_UNAVAILABLE',
+          productId: item.productId,
+        },
+      };
+    }
+
+    calculatedTotal += variant.price * item.quantity;
+    orderItemsData.push({
+      variantId: variant.id,
+      quantity: item.quantity,
+      priceAtPurchase: variant.price,
+      title: variant.label ? `${product.title} (${variant.label})` : product.title,
+    });
+  }
+
+  // Two lines of the same variant would each pass the stock check
+  // independently; merge them so the reservation is checked against the total.
+  const merged = new Map<string, PricedItem>();
+  for (const item of orderItemsData) {
+    const existing = merged.get(item.variantId);
+    if (existing) {
+      existing.quantity += item.quantity;
+    } else {
+      merged.set(item.variantId, { ...item });
+    }
+  }
+
+  return { orderItemsData: [...merged.values()], calculatedTotal };
+}
+
+/** Turns a reservation into a real stock decrement. */
+async function commitReservedStock(
+  tx: Prisma.TransactionClient,
+  items: { variantId: string; quantity: number }[]
+) {
+  for (const item of items) {
+    await tx.inventory.update({
+      where: { variantId: item.variantId },
+      data: {
+        stockCount: { decrement: item.quantity },
+        reserved: { decrement: item.quantity },
+      },
+    });
+  }
+}
+
+/** Rolls back a reservation and voids the order after a failed payment init. */
+async function releaseOrder(orderId: string, items: { variantId: string; quantity: number }[]) {
+  await prisma.$transaction(async (tx) => {
+    for (const item of items) {
+      await tx.inventory.update({
+        where: { variantId: item.variantId },
+        data: { reserved: { decrement: item.quantity } },
+      });
+    }
+    await tx.order.update({
+      where: { id: orderId },
+      data: { status: OrderStatus.CANCELLED },
+    });
+  });
+}
+
+function readIdempotencyKey(req: Request): string | null {
+  const raw = req.headers['x-idempotency-key'];
+  if (typeof raw !== 'string') return null;
+  const key = raw.trim();
+  // Bound the key so it cannot be used to write arbitrarily large Redis keys.
+  if (!key || key.length > 100 || !/^[A-Za-z0-9._:-]+$/.test(key)) return null;
+  return key;
+}
+
+async function resolveIdempotentOrder(key: string): Promise<string | 'in-flight' | null> {
+  const value = await redisTry((c) => c.get(key), null);
+  if (!value) return null;
+  return value === 'in-flight' ? 'in-flight' : value;
+}
+
+async function finishIdempotency(key: string | null, claimed: boolean, orderId: string) {
+  if (!key || !claimed) return;
+  await redisTry((c) => c.setex(key, 24 * 60 * 60, orderId), null);
+}
+
+async function clearIdempotency(key: string | null, claimed: boolean) {
+  if (!key || !claimed) return;
+  await redisTry((c) => c.del(key), null);
+}
+
+/** Pulls the first human-readable message out of a Zod error. */
+function firstZodMessage(error: z.ZodError): string | null {
+  const issue = error.issues[0];
+  if (!issue) return null;
+  return issue.message;
+}
 
 export default router;

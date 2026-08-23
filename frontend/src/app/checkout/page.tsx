@@ -1,28 +1,34 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback } from "react";
 import Link from "next/link";
 import Image from "next/image";
 import { useRouter } from "next/navigation";
-import { ChevronRight, ChevronLeft, CreditCard, Banknote, Search, HelpCircle, ArrowLeft, ShoppingCart, User, QrCode, X, Loader2 } from "lucide-react";
+import { useSession } from "next-auth/react";
+import { ChevronRight, ChevronLeft, CreditCard, Banknote, HelpCircle, ArrowLeft, ShoppingCart, User, QrCode, Loader2, AlertTriangle, ShieldCheck } from "lucide-react";
 import { useCartStore } from "@/store/cartStore";
 import { useUserStore } from "@/store/userStore";
-import { QRCodeSVG } from "qrcode.react";
+import { apiFetch, ApiError, errorMessage } from "@/lib/api";
+import { openRazorpayCheckout } from "@/lib/razorpay";
+import { formatRupees } from "@/lib/format";
 
 export default function CheckoutPage() {
   const router = useRouter();
+  const { data: session, status: sessionStatus } = useSession();
   const cartItems = useCartStore(state => state.items);
   const total = useCartStore(state => state.totalPrice());
   const clearCart = useCartStore(state => state.clearCart);
-  
+
   const profile = useUserStore(state => state.profile);
   const updateProfile = useUserStore(state => state.updateProfile);
 
   const [paymentMethod, setPaymentMethod] = useState<'card'|'upi'|'cod'>('card');
-  const [showUpiModal, setShowUpiModal] = useState(false);
-  const [createdOrderId, setCreatedOrderId] = useState<string | null>(null);
   const [isProcessing, setIsProcessing] = useState(false);
+  const [processingLabel, setProcessingLabel] = useState("Processing...");
   const [mounted, setMounted] = useState(false);
+
+  /** Banner shown above the form when the order cannot be placed. */
+  const [failure, setFailure] = useState<{ message: string; code: string | null } | null>(null);
 
   // Form states initialized from userStore
   const [email, setEmail] = useState(profile.email);
@@ -34,123 +40,193 @@ export default function CheckoutPage() {
   const [pinCode, setPinCode] = useState(profile.pinCode);
   const [phone, setPhone] = useState(profile.phone);
   
-  // Card states
-  const [cardNumber, setCardNumber] = useState(profile.cardNumber);
-  const [cardName, setCardName] = useState(profile.cardName);
-  const [cardExpiry, setCardExpiry] = useState(profile.cardExpiry);
-  const [cardCvv, setCardCvv] = useState(profile.cardCvv);
-
   // Error state for validation
   const [errors, setErrors] = useState<{ [key: string]: boolean }>({});
 
   useEffect(() => setMounted(true), []);
 
-  // Poll for payment status if UPI
+  // An empty cart has nothing to check out.
   useEffect(() => {
-    if (!showUpiModal || !createdOrderId) return;
-    const interval = setInterval(async () => {
-      try {
-        const res = await fetch(`/api/proxy/orders/${createdOrderId}`);
-        const order = await res.json();
-        if (order.status === 'PAID') {
-          clearInterval(interval);
-          clearCart();
-          router.push(`/track?id=${createdOrderId}`);
-        }
-      } catch (err) {}
-    }, 2000);
-    return () => clearInterval(interval);
-  }, [showUpiModal, createdOrderId, router, clearCart]);
+    if (mounted && cartItems.length === 0 && !isProcessing) {
+      router.replace("/cart");
+    }
+  }, [mounted, cartItems.length, isProcessing, router]);
 
   const handlePaymentSelect = (method: 'card'|'upi'|'cod') => {
     setPaymentMethod(method);
     setErrors({});
+    setFailure(null);
   };
 
-  const handleCheckout = async () => {
-    if (cartItems.length === 0) return;
-    
-    // Validation
+  /** Validates the shipping form. Card details are collected by Razorpay, not here. */
+  const validate = useCallback(() => {
     const newErrors: { [key: string]: boolean } = {};
-    
+
     if (!email || !/^\S+@\S+\.\S+$/.test(email)) newErrors.email = true;
     if (!firstName.trim()) newErrors.firstName = true;
     if (!lastName.trim()) newErrors.lastName = true;
     if (!address.trim()) newErrors.address = true;
     if (!city.trim()) newErrors.city = true;
     if (!stateRegion) newErrors.stateRegion = true;
-    if (!pinCode || !/^\d{6}$/.test(pinCode.replace(/\D/g, ''))) newErrors.pinCode = true;
-    if (!phone || !/^\d{10}$/.test(phone.replace(/\D/g, ''))) newErrors.phone = true;
+    if (!/^\d{6}$/.test(pinCode.replace(/\D/g, ''))) newErrors.pinCode = true;
+    if (!/^\d{10}$/.test(phone.replace(/\D/g, ''))) newErrors.phone = true;
 
-    if (paymentMethod === 'card') {
-      if (!cardNumber || !/^\d{16}$/.test(cardNumber.replace(/\D/g, ''))) newErrors.cardNumber = true;
-      if (!cardName.trim()) newErrors.cardName = true;
-      if (!cardExpiry || !/^(0[1-9]|1[0-2])\/?([0-9]{2})$/.test(cardExpiry)) newErrors.cardExpiry = true;
-      if (!cardCvv || !/^\d{3,4}$/.test(cardCvv)) newErrors.cardCvv = true;
+    setErrors(newErrors);
+    return Object.keys(newErrors).length === 0;
+  }, [email, firstName, lastName, address, city, stateRegion, pinCode, phone]);
+
+  /** Tells the backend a payment attempt was declined or abandoned. */
+  const reportPaymentFailure = async (orderId: string, reason: string) => {
+    try {
+      await apiFetch(`orders/${orderId}/payment-failed`, { method: "POST", body: { reason } });
+    } catch {
+      // Best effort: the stale-checkout sweep releases the stock either way.
+    }
+  };
+
+  const handleCheckout = async () => {
+    if (cartItems.length === 0 || isProcessing) return;
+
+    setFailure(null);
+
+    if (sessionStatus === "unauthenticated") {
+      router.push(`/login?callbackUrl=${encodeURIComponent("/checkout")}`);
+      return;
     }
 
-    if (Object.keys(newErrors).length > 0) {
-      setErrors(newErrors);
-      // Scroll to top to see errors if many
+    if (!validate()) {
       window.scrollTo({ top: 0, behavior: 'smooth' });
       return;
     }
 
-    setErrors({});
     setIsProcessing(true);
+    setProcessingLabel("Placing your order...");
 
-    // Save to profile
-    updateProfile({
-      email, firstName, lastName, address, city, stateRegion, pinCode, phone,
-      cardNumber: paymentMethod === 'card' ? cardNumber : profile.cardNumber,
-      cardName: paymentMethod === 'card' ? cardName : profile.cardName,
-      cardExpiry: paymentMethod === 'card' ? cardExpiry : profile.cardExpiry,
-      cardCvv: paymentMethod === 'card' ? cardCvv : profile.cardCvv
-    });
+    // Persist the shipping details for next time. Card data is never stored.
+    updateProfile({ email, firstName, lastName, address, city, stateRegion, pinCode, phone });
 
+    let order: any;
     try {
-      // Generate idempotency key to prevent duplicate orders on double-click/retry
-      const idempotencyKey = crypto.randomUUID();
-      
-      const res = await fetch("/api/proxy/orders", {
+      // A stable key per attempt: a double-click or a retry after a network
+      // blip resolves to the same order instead of creating a second one.
+      const idempotencyKey =
+        typeof crypto !== "undefined" && crypto.randomUUID
+          ? crypto.randomUUID()
+          : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+
+      order = await apiFetch("orders", {
         method: "POST",
-        headers: { 
-          "Content-Type": "application/json",
-          "x-idempotency-key": idempotencyKey,
-        },
-        body: JSON.stringify({
+        idempotencyKey,
+        body: {
           items: cartItems.map(i => ({
-            productId: i.productId || i.id.replace(/-(12GB\+256GB|16GB\+512GB|24GB\+1TB)$/, ''),
+            productId: i.productId,
+            ...(i.variantId ? { variantId: i.variantId } : {}),
             quantity: i.quantity,
           })),
           paymentMethod,
           shippingAddress: {
-             email, firstName, lastName, address, city, state: stateRegion, pinCode, phone, country: "India"
-          }
-        })
+            email, firstName, lastName, address, city,
+            state: stateRegion, pinCode, phone, country: "India",
+          },
+        },
       });
-      const order = await res.json();
-      
-      if (!res.ok) {
-        throw new Error(order.error || "Failed to create order");
-      }
-      
-      if (paymentMethod === 'upi') {
-        setCreatedOrderId(order.id);
-        setShowUpiModal(true);
-      } else {
-        clearCart();
-        router.push(`/track?id=${order.id}`);
-      }
-    } catch (err: any) {
-      console.error(err);
-      alert(err.message || "Failed to create order");
-    } finally {
+    } catch (err) {
       setIsProcessing(false);
+
+      if (err instanceof ApiError) {
+        if (err.isAuthError) {
+          router.push(`/login?callbackUrl=${encodeURIComponent("/checkout")}`);
+          return;
+        }
+        // A sold-out line can be pointed at precisely.
+        if (err.code === "OUT_OF_STOCK" || err.code === "PRODUCT_UNAVAILABLE" || err.code === "VARIANT_UNAVAILABLE") {
+          setFailure({ message: err.message, code: err.code });
+          window.scrollTo({ top: 0, behavior: 'smooth' });
+          return;
+        }
+      }
+
+      setFailure({ message: errorMessage(err), code: err instanceof ApiError ? err.code : null });
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+      return;
+    }
+
+    // Cash on Delivery is confirmed server-side; nothing to pay now.
+    if (paymentMethod === 'cod') {
+      clearCart();
+      router.push(`/track?id=${order.id}`);
+      return;
+    }
+
+    // ── Online payment: hand off to Razorpay Checkout ──────────────────
+    if (!order?.payment?.providerOrderId) {
+      setIsProcessing(false);
+      setFailure({
+        message: "We could not start the payment for this order. No money has been taken — please try again.",
+        code: "PAYMENT_INIT_FAILED",
+      });
+      return;
+    }
+
+    setProcessingLabel("Opening secure payment...");
+
+    let outcome;
+    try {
+      outcome = await openRazorpayCheckout({
+        providerOrderId: order.payment.providerOrderId,
+        amountPaise: order.payment.amount,
+        currency: order.payment.currency || "INR",
+        orderId: order.id,
+        customer: {
+          name: `${firstName} ${lastName}`.trim(),
+          email,
+          contact: phone,
+        },
+        method: paymentMethod,
+      });
+    } catch (err) {
+      setIsProcessing(false);
+      await reportPaymentFailure(order.id, errorMessage(err));
+      setFailure({ message: errorMessage(err), code: "CHECKOUT_UNAVAILABLE" });
+      return;
+    }
+
+    if (outcome.kind === "dismissed") {
+      setIsProcessing(false);
+      await reportPaymentFailure(order.id, "Customer closed the payment window");
+      setFailure({
+        message: "Payment was cancelled, so your order has not been placed. Your cart is still here whenever you're ready.",
+        code: "PAYMENT_CANCELLED",
+      });
+      return;
+    }
+
+    if (outcome.kind === "failed") {
+      setIsProcessing(false);
+      await reportPaymentFailure(order.id, outcome.message);
+      setFailure({ message: outcome.message, code: outcome.code ?? "PAYMENT_DECLINED" });
+      return;
+    }
+
+    // ── Payment succeeded: confirm it server-side ──────────────────────
+    setProcessingLabel("Confirming your payment...");
+    try {
+      await apiFetch(`orders/${order.id}/pay`, {
+        method: "POST",
+        body: outcome.handshake,
+      });
+      clearCart();
+      router.push(`/track?id=${order.id}`);
+    } catch (err) {
+      setIsProcessing(false);
+      setFailure({
+        message: `${errorMessage(err)} Your payment reference is ${outcome.handshake.razorpay_payment_id} — quote it if you need to contact us.`,
+        code: "PAYMENT_CONFIRM_FAILED",
+      });
     }
   };
 
-  const formattedTotal = "₹" + total.toLocaleString("en-IN");
+  const formattedTotal = formatRupees(total);
   
   const getInputClass = (field: string) => {
     return `w-full bg-transparent border p-4 outline-none text-sm font-medium transition-all duration-300 ${
@@ -169,31 +245,6 @@ export default function CheckoutPage() {
   return (
     <div className="min-h-screen bg-[#0a0a0a] text-white font-inter flex flex-col md:flex-row relative">
       
-      {/* UPI QR Modal */}
-      {showUpiModal && createdOrderId && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/90 backdrop-blur-sm p-4">
-          <div className="bg-[#111] border border-[#333] p-10 w-full max-w-md flex flex-col items-center relative shadow-2xl">
-            <button 
-              onClick={() => setShowUpiModal(false)}
-              className="absolute top-6 right-6 text-gray-500 hover:text-[#FF003C] transition-colors active:scale-95"
-            >
-              <X size={28} />
-            </button>
-            <h3 className="text-2xl font-black uppercase tracking-widest mb-2">Scan to Pay</h3>
-            <p className="text-sm text-gray-400 mb-10 font-medium">Amount: {formattedTotal}</p>
-            
-            <div className="bg-white p-6 w-64 h-64 flex items-center justify-center border-4 border-[#FF003C]">
-              <QRCodeSVG value={`https://everything-oddy.vercel.app/pay/${createdOrderId}`} size={200} />
-            </div>
-            
-            <div className="mt-10 flex items-center gap-3">
-              <Loader2 className="w-5 h-5 text-[#FF003C] animate-spin" />
-              <p className="text-xs font-bold uppercase tracking-widest text-gray-400">Waiting for payment...</p>
-            </div>
-          </div>
-        </div>
-      )}
-
       {/* Left Column: Form Area */}
       <div className="flex-1 flex md:justify-end border-r border-[#222]">
         <div className="w-full md:max-w-[700px] px-6 py-10 md:px-12 md:py-16 flex flex-col">
@@ -228,6 +279,40 @@ export default function CheckoutPage() {
             <ChevronRight size={14} />
             <span>Payment</span>
           </div>
+
+          {/* Anything that stopped the order from going through, shown in
+              context instead of a browser alert() the customer can't act on. */}
+          {failure && (
+            <div
+              role="alert"
+              aria-live="assertive"
+              className="mb-10 flex items-start gap-4 border border-[#FF003C] bg-[#1a0509] p-6"
+            >
+              <AlertTriangle size={22} className="text-[#FF003C] shrink-0 mt-0.5" />
+              <div className="flex flex-col gap-3">
+                <p className="text-sm font-bold uppercase tracking-widest text-[#FF003C]">
+                  {failure.code === "OUT_OF_STOCK"
+                    ? "Item unavailable"
+                    : failure.code === "PAYMENT_CANCELLED"
+                    ? "Payment cancelled"
+                    : failure.code === "PAYMENT_DECLINED"
+                    ? "Payment declined"
+                    : "We couldn't place your order"}
+                </p>
+                <p className="text-sm text-gray-300 font-medium leading-relaxed">{failure.message}</p>
+                {(failure.code === "OUT_OF_STOCK" ||
+                  failure.code === "PRODUCT_UNAVAILABLE" ||
+                  failure.code === "VARIANT_UNAVAILABLE") && (
+                  <Link
+                    href="/cart"
+                    className="text-xs font-bold uppercase tracking-widest text-white underline underline-offset-4 hover:text-[#FF003C] transition-colors w-fit"
+                  >
+                    Edit your cart
+                  </Link>
+                )}
+              </div>
+            </div>
+          )}
 
           {/* Payment Methods */}
           <div className="mb-10 w-full relative pt-3">
@@ -266,58 +351,25 @@ export default function CheckoutPage() {
               </button>
             </div>
 
-            {/* Card Inputs Condition */}
-            {paymentMethod === 'card' && (
-              <div className="mt-6 flex flex-col gap-4 bg-[#111] border border-[#222] p-6 shadow-inner">
-                <input 
-                  type="text" 
-                  value={cardNumber}
-                  onChange={(e) => { 
-                    const val = e.target.value.replace(/\D/g, '').slice(0, 16);
-                    setCardNumber(val); 
-                    setErrors({...errors, cardNumber: false}); 
-                  }}
-                  placeholder="Card number" 
-                  className={getInputClass('cardNumber')}
-                  autoComplete="off"
-                />
-                <div className="grid grid-cols-2 gap-4">
-                  <input 
-                    type="text" 
-                    value={cardExpiry}
-                    onChange={(e) => { 
-                      let val = e.target.value.replace(/\D/g, '').slice(0, 4);
-                      if (val.length > 2) val = val.slice(0, 2) + '/' + val.slice(2);
-                      setCardExpiry(val); 
-                      setErrors({...errors, cardExpiry: false}); 
-                    }}
-                    placeholder="MM/YY" 
-                    maxLength={5}
-                    className={getInputClass('cardExpiry')}
-                    autoComplete="off"
-                  />
-                  <input 
-                    type="text" 
-                    value={cardCvv}
-                    onChange={(e) => { 
-                      const val = e.target.value.replace(/\D/g, '').slice(0, 4);
-                      setCardCvv(val); 
-                      setErrors({...errors, cardCvv: false}); 
-                    }}
-                    placeholder="Security code (CVV)" 
-                    className={getInputClass('cardCvv')}
-                    maxLength={4}
-                    autoComplete="off"
-                  />
-                </div>
-                <input 
-                  type="text" 
-                  value={cardName}
-                  onChange={(e) => { setCardName(e.target.value); setErrors({...errors, cardName: false}); }}
-                  placeholder="Name on card" 
-                  className={getInputClass('cardName')}
-                  autoComplete="off"
-                />
+            {/* Card and UPI details are entered inside Razorpay's secure window,
+                so no payment credentials are ever handled by this site. */}
+            {paymentMethod !== 'cod' && (
+              <div className="mt-6 flex items-start gap-3 bg-[#111] border border-[#222] p-6 shadow-inner">
+                <ShieldCheck size={20} className="text-[#00a86b] shrink-0 mt-0.5" />
+                <p className="text-sm text-gray-400 font-medium leading-relaxed">
+                  {paymentMethod === 'card'
+                    ? "You'll enter your card details in Razorpay's secure payment window after you confirm this order. We never see or store your card number."
+                    : "You'll be shown a UPI QR code and app options in Razorpay's secure payment window after you confirm this order."}
+                </p>
+              </div>
+            )}
+
+            {paymentMethod === 'cod' && (
+              <div className="mt-6 flex items-start gap-3 bg-[#111] border border-[#222] p-6 shadow-inner">
+                <Banknote size={20} className="text-[#00a86b] shrink-0 mt-0.5" />
+                <p className="text-sm text-gray-400 font-medium leading-relaxed">
+                  Pay in cash when your order is delivered. Nothing is charged now.
+                </p>
               </div>
             )}
           </div>
@@ -428,16 +480,19 @@ export default function CheckoutPage() {
               </Link>
               <button 
                 onClick={handleCheckout}
-                disabled={isProcessing}
+                disabled={isProcessing || cartItems.length === 0}
+                aria-busy={isProcessing}
                 className="bg-[#FF003C] disabled:bg-gray-800 disabled:cursor-not-allowed hover:bg-[#CC0030] text-white py-4 px-8 font-bold text-sm uppercase tracking-widest transition-all duration-200 active:scale-[0.98] flex items-center justify-center min-w-[240px]"
               >
                 {isProcessing ? (
                   <>
                     <Loader2 className="w-4 h-4 mr-2 animate-spin" />
-                    Processing...
+                    {processingLabel}
                   </>
+                ) : paymentMethod === 'cod' ? (
+                  `Place order · ${formattedTotal}`
                 ) : (
-                  "Continue to shipping"
+                  `Pay ${formattedTotal}`
                 )}
               </button>
             </div>
@@ -464,8 +519,11 @@ export default function CheckoutPage() {
                 </div>
                 <div className="flex-1 flex flex-col pt-1">
                   <span className="text-sm font-bold uppercase tracking-wider text-white">{item.title}</span>
+                  {item.variantLabel && (
+                    <span className="text-[10px] uppercase tracking-widest text-gray-500 mt-1">{item.variantLabel}</span>
+                  )}
                 </div>
-                <span className="text-sm font-bold text-white">{"₹" + (item.price * item.quantity).toLocaleString("en-IN")}</span>
+                <span className="text-sm font-bold text-white">{formatRupees(item.price * item.quantity)}</span>
               </div>
             ))}
           </div>

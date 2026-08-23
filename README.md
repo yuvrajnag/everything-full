@@ -62,10 +62,12 @@ everything-full/
 │
 ├── backend/                  # Node.js/Express Application
 │   ├── src/
+│   │   ├── config/           # Environment loading and validation
 │   │   ├── routes/           # Express API endpoints
-│   │   ├── controllers/      # Business logic and request handlers
-│   │   └── services/         # Third-party integrations (Payment mock, etc.)
-│   ├── prisma/               # Database schema and migrations
+│   │   ├── middleware/       # Internal-secret and identity checks
+│   │   ├── serializers/      # Shared API response shapes
+│   │   └── services/         # Third-party integrations (Razorpay)
+│   ├── prisma/               # Database schema and seed
 │   └── .env                  # Backend Environment Variables
 │
 └── README.md
@@ -88,15 +90,22 @@ npm install
 
 # Configure environment
 cp .env.example .env
-# Required: DATABASE_URL, DIRECT_URL, REDIS_URL, INTERNAL_API_KEY
+# Required: DATABASE_URL, DIRECT_URL, INTERNAL_API_KEY
+# For card/UPI payments: RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET (test-mode keys)
+# Optional: REDIS_URL, ALLOWED_ORIGINS
 
 # Generate Prisma Client & sync schema
 npx prisma generate
 npx prisma db push
 
+# Load the catalogue
+npm run seed
+
 # Boot server
 npm run dev
 ```
+
+Leaving the Razorpay keys empty is supported: the store runs Cash on Delivery only, and card/UPI checkout is rejected with a clear message instead of failing silently.
 
 ### 2. Frontend Initialization
 ```bash
@@ -104,18 +113,31 @@ cd frontend
 npm install
 
 # Configure environment
-cp .env.example .env
+cp .env.example .env.local
 # Required: NEXTAUTH_SECRET, GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET
 # Ensure INTERNAL_API_KEY matches the backend configuration
 # Set NEXT_PUBLIC_API_URL to http://localhost:5000/api
+# Set NEXT_PUBLIC_RAZORPAY_KEY_ID to the same key id as the backend
 
 # Boot client
 npm run dev
 ```
 
+> The Prisma schema in `frontend/prisma` is a copy of the backend's, needed only
+> by the NextAuth adapter. Run migrations from `backend/` — never `prisma db push`
+> from the frontend, or the two will drift.
+
 The application will initialize at `http://localhost:3000`.
 
 ---
 
+## MONEY UNITS
+
+Every amount is stored and transmitted in **paise**. Order API fields carry a
+`Paise` suffix (`totalPaise`, `unitPricePaise`) precisely so a UI cannot render
+one as rupees by accident. Use `frontend/src/lib/format.ts` for display.
+
+---
+
 ## PROJECT DISCLOSURE
-This application is a proprietary demonstration platform engineered by Silver Cloud Labs (a division of Beyond Studios). It is specifically designed as a controlled environment for testing advanced Artificial Intelligence models, automated agent workflows, and next-generation UI/UX interactions. All products, prices, and payments are strictly mocked for demonstration purposes.
+This application is a demonstration storefront engineered by Silver Cloud Labs (a division of Beyond Studios). Products and prices are fictional. Payments run against Razorpay in **test mode** — no real money moves unless the store is pointed at live keys.

@@ -6,6 +6,7 @@ import { Search, ShoppingCart, User, TriangleAlert } from "lucide-react";
 import Link from "next/link";
 import { useCartStore } from "@/store/cartStore";
 import { performSearch } from "@/lib/searchUtils";
+import { apiFetch } from "@/lib/api";
 import { useRouter } from "next/navigation";
 
 export function Navbar() {
@@ -24,10 +25,10 @@ export function Navbar() {
 
   useEffect(() => {
     setMounted(true);
-    fetch("/api/proxy/products")
-      .then(res => res.json())
-      .then(data => setProducts(Array.isArray(data) ? data : []))
-      .catch(err => console.error(err));
+    // Search suggestions are a nicety: a failure here must not break the header.
+    apiFetch<any[]>("products")
+      .then((data) => setProducts(Array.isArray(data) ? data : []))
+      .catch(() => setProducts([]));
   }, []);
 
   useEffect(() => {
@@ -111,7 +112,7 @@ export function Navbar() {
               {searchResults.map((product) => (
                 <Link 
                   key={product.id} 
-                  href={`/product/${product.title.toLowerCase().replace(/[^a-z0-9]+/g, '-')}`}
+                  href={`/product/${product.slug}`}
                   className="flex items-center gap-4 p-4 border-b border-[#222] hover:bg-[#1a1a1a] transition-colors"
                   onClick={() => {
                     setSearchQuery("");

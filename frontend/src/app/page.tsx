@@ -4,28 +4,26 @@ import { ProductGrid } from "@/components/home/ProductGrid";
 import { HeroBanner } from "@/components/home/HeroBanner";
 import { Suspense } from "react";
 
+/**
+ * Server-side catalogue fetch for the first paint. The API already returns
+ * local image paths and slugs, so nothing needs rewriting here.
+ *
+ * On failure this returns an empty list and the client component re-fetches
+ * through the proxy, showing an error if that fails too.
+ */
 async function getProducts() {
   try {
     const backendUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:5000/api';
-    // Use no-store to ensure we get fresh products, or revalidate. 
-    // We will use revalidate: 10 so it's extremely fast but stays relatively fresh.
-    const res = await fetch(`${backendUrl}/products`, { next: { revalidate: 10 } });
-    if (!res.ok) return [];
-    
-    const data = await res.json();
-    
-    // Process images on the server so the client doesn't have to
-    return data.map((p: any) => {
-      if (p.imageUrl && p.imageUrl.includes('res.cloudinary.com')) {
-         p.imageUrl = `/products/${p.imageUrl.split('/').pop()}`;
-      }
-      if (p.hoverImageUrl && p.hoverImageUrl.includes('res.cloudinary.com')) {
-         p.hoverImageUrl = `/products/${p.hoverImageUrl.split('/').pop()}`;
-      }
-      return p;
+    const res = await fetch(`${backendUrl}/products`, {
+      next: { revalidate: 30 },
+      signal: AbortSignal.timeout(10_000),
     });
+    if (!res.ok) return [];
+
+    const data = await res.json();
+    return Array.isArray(data) ? data : [];
   } catch (error) {
-    console.error("Failed to fetch products on server:", error);
+    console.error('Failed to fetch products on the server:', error);
     return [];
   }
 }

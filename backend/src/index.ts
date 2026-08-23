@@ -1,83 +1,96 @@
+// Environment must be loaded before anything that reads process.env at import
+// time (db, redis, payment provider).
+import { env } from './config/env';
+
 import express, { Request, Response, NextFunction } from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
-import dotenv from 'dotenv';
 import rateLimit from 'express-rate-limit';
+import pino from 'pino';
+import pinoHttp from 'pino-http';
+import { RedisStore } from 'rate-limit-redis';
+import { OrderStatus, PaymentStatus } from '@prisma/client';
+
 import productRoutes from './routes/products';
 import orderRoutes from './routes/orders';
 import { prisma } from './db';
-import redis from './lib/redis';
-import { RedisStore } from 'rate-limit-redis';
-import pino from 'pino';
-import pinoHttp from 'pino-http';
+import redis, { isRedisHealthy } from './lib/redis';
 
-const pinoOptions: any = {
-  level: process.env.LOG_LEVEL || 'info',
-};
-if (process.env.NODE_ENV !== 'production') {
+const pinoOptions: any = { level: env.logLevel };
+if (!env.isProduction) {
   pinoOptions.transport = { target: 'pino-pretty' };
 }
 const logger = pino(pinoOptions);
 
-dotenv.config();
-
-// ─── Environment validation ────────────────────────────────────────────
-const REQUIRED_ENV = ['DATABASE_URL'];
-for (const key of REQUIRED_ENV) {
-  if (!process.env[key]) {
-    logger.fatal(`Missing required environment variable: ${key}`);
-    process.exit(1);
-  }
-}
-
 const app = express();
-const port = process.env.PORT || 5000;
 
-const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || 'http://localhost:3000').split(',');
-
-app.use(pinoHttp({ logger, autoLogging: { ignore: (req) => req.url?.startsWith('/health') || false } }));
+app.use(
+  pinoHttp({
+    logger,
+    autoLogging: { ignore: (req) => req.url?.startsWith('/health') || false },
+    // Never log the internal secret or auth headers.
+    redact: ['req.headers["x-internal-secret"]', 'req.headers.authorization', 'req.headers.cookie'],
+  })
+);
 
 // ─── Security middleware ───────────────────────────────────────────────
-app.use(helmet({
-  contentSecurityPolicy: {
-    directives: {
-      defaultSrc: ["'self'"],
-      scriptSrc: ["'self'"],
-      styleSrc: ["'self'", "'unsafe-inline'"],
-      imgSrc: ["'self'", "https://res.cloudinary.com", "data:"],
-      connectSrc: ["'self'"],
+app.use(
+  helmet({
+    contentSecurityPolicy: {
+      directives: {
+        defaultSrc: ["'self'"],
+        scriptSrc: ["'self'"],
+        styleSrc: ["'self'", "'unsafe-inline'"],
+        imgSrc: ["'self'", 'https://res.cloudinary.com', 'data:'],
+        connectSrc: ["'self'"],
+      },
     },
-  },
-  crossOriginEmbedderPolicy: false,
-}));
+    crossOriginEmbedderPolicy: false,
+  })
+);
 
-app.use(cors({
-  origin: (origin, callback) => {
-    // Allow requests with no origin (server-to-server, health checks)
-    if (!origin || ALLOWED_ORIGINS.includes(origin)) {
-      callback(null, true);
-    } else {
-      callback(new Error('Not allowed by CORS'));
-    }
-  },
-  credentials: true,
-  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'x-internal-secret', 'x-user-id', 'x-user-role'],
-}));
+app.use(
+  cors({
+    origin: (origin, callback) => {
+      // Requests with no origin are server-to-server (the Next.js proxy) or
+      // health checks.
+      if (!origin || env.allowedOrigins.includes(origin)) {
+        callback(null, true);
+      } else {
+        callback(new Error('Not allowed by CORS'));
+      }
+    },
+    credentials: true,
+    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'],
+    allowedHeaders: [
+      'Content-Type',
+      'Authorization',
+      'x-internal-secret',
+      'x-user-id',
+      'x-user-role',
+      'x-idempotency-key',
+    ],
+  })
+);
 
-// Body size limit to prevent payload abuse
 app.use(express.json({ limit: '1mb' }));
 app.use(express.urlencoded({ extended: false, limit: '1mb' }));
 
 const globalLimiter = rateLimit({
-  windowMs: 60 * 1000, // 1 minute
-  max: 200,
+  windowMs: 60 * 1000,
+  max: 300,
   standardHeaders: true,
   legacyHeaders: false,
-  store: new RedisStore({
-    sendCommand: (...args: string[]) => redis.call(args[0]!, ...args.slice(1)) as any,
-  }),
-  message: { error: 'Too many requests, please try again later.' },
+  // Only back the limiter with Redis when Redis is actually up, otherwise a
+  // Redis outage takes the whole store down.
+  ...(isRedisHealthy()
+    ? {
+        store: new RedisStore({
+          sendCommand: (...args: string[]) => redis.call(args[0]!, ...args.slice(1)) as any,
+        }),
+      }
+    : {}),
+  message: { error: 'Too many requests, please try again later.', code: 'RATE_LIMITED' },
 });
 app.use(globalLimiter);
 
@@ -90,77 +103,176 @@ app.get('/health/live', (_req: Request, res: Response) => {
 });
 
 app.get('/health/ready', async (_req: Request, res: Response) => {
+  const checks: Record<string, string> = {};
+  let ready = true;
+
   try {
     await prisma.$queryRaw`SELECT 1`;
-    await redis.ping();
-    res.json({ status: 'READY', uptime: process.uptime(), timestamp: new Date().toISOString() });
+    checks.database = 'ok';
   } catch (err: any) {
-    logger.error({ err }, 'Health check failed');
-    res.status(503).json({ status: 'DOWN', error: err.message });
+    checks.database = err.message;
+    ready = false; // The database is the only hard dependency.
   }
+
+  try {
+    await redis.ping();
+    checks.redis = 'ok';
+  } catch (err: any) {
+    // Degraded, not down: caching and rate limiting fall back to local state.
+    checks.redis = `degraded: ${err.message}`;
+  }
+
+  res.status(ready ? 200 : 503).json({
+    status: ready ? 'READY' : 'DOWN',
+    checks,
+    uptime: process.uptime(),
+    timestamp: new Date().toISOString(),
+  });
 });
 
 // ─── 404 handler ───────────────────────────────────────────────────────
 app.use((_req: Request, res: Response) => {
-  res.status(404).json({ error: 'Not found' });
+  res.status(404).json({ error: 'Not found', code: 'NOT_FOUND' });
 });
 
 // ─── Global error handler ──────────────────────────────────────────────
 app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
   logger.error({ err }, 'Unhandled Exception');
   res.status(500).json({
-    error: process.env.NODE_ENV === 'production' ? 'Internal server error' : err.message,
+    error: env.isProduction ? 'Internal server error' : err.message,
+    code: 'INTERNAL_ERROR',
   });
 });
 
-// ─── Server lifecycle ──────────────────────────────────────────────────
-let autoProgressInterval: ReturnType<typeof setInterval>;
+// ─── Background jobs ───────────────────────────────────────────────────
+/**
+ * Simulated logistics. Timings are deliberately long enough that a customer
+ * has a realistic window to cancel — the previous 1-minute PAID -> SHIPPED
+ * hop made almost every order non-cancellable before the customer could act.
+ */
+const SHIP_AFTER_MS = 60 * 60 * 1000; // 1 hour
+const DELIVER_AFTER_MS = 3 * 24 * 60 * 60 * 1000; // 3 days
 
-const server = app.listen(port, () => {
-  logger.info(`Server running on port ${port} (${process.env.NODE_ENV || 'development'})`);
+/** Checkouts abandoned this long ago release their reserved stock. */
+const RESERVATION_TTL_MS = 30 * 60 * 1000; // 30 minutes
 
-  // Auto-progress order statuses (simulated logistics)
-  autoProgressInterval = setInterval(async () => {
+async function progressOrders() {
+  const now = Date.now();
+
+  await prisma.order.updateMany({
+    where: {
+      status: { in: [OrderStatus.PAID, OrderStatus.CONFIRMED] },
+      updatedAt: { lt: new Date(now - SHIP_AFTER_MS) },
+    },
+    data: { status: OrderStatus.SHIPPED },
+  });
+
+  await prisma.order.updateMany({
+    where: {
+      status: OrderStatus.SHIPPED,
+      updatedAt: { lt: new Date(now - DELIVER_AFTER_MS) },
+    },
+    data: { status: OrderStatus.DELIVERED },
+  });
+}
+
+/**
+ * Releases inventory held by checkouts the customer never completed.
+ * Without this, every abandoned card/UPI checkout permanently removed those
+ * units from sale.
+ */
+async function releaseStaleReservations() {
+  const cutoff = new Date(Date.now() - RESERVATION_TTL_MS);
+
+  const stale = await prisma.order.findMany({
+    where: { status: OrderStatus.PENDING, createdAt: { lt: cutoff } },
+    include: { items: true },
+    take: 50,
+  });
+
+  for (const order of stale) {
     try {
-      const now = new Date();
+      await prisma.$transaction(async (tx) => {
+        // Re-check inside the transaction: the customer may have just paid.
+        const fresh = await tx.order.findUnique({
+          where: { id: order.id },
+          select: { status: true },
+        });
+        if (fresh?.status !== OrderStatus.PENDING) return;
 
-      // PAID -> SHIPPED (1 min after order creation)
-      const oneMinAgo = new Date(now.getTime() - 1 * 60 * 1000);
-      await prisma.order.updateMany({
-        where: { status: 'PAID', createdAt: { lt: oneMinAgo } },
-        data: { status: 'SHIPPED' },
-      });
+        for (const item of order.items) {
+          await tx.inventory.update({
+            where: { variantId: item.variantId },
+            data: { reserved: { decrement: item.quantity } },
+          });
+        }
 
-      // SHIPPED -> DELIVERED (5 mins after order creation)
-      const fiveMinsAgo = new Date(now.getTime() - 5 * 60 * 1000);
-      await prisma.order.updateMany({
-        where: { status: 'SHIPPED', createdAt: { lt: fiveMinsAgo } },
-        data: { status: 'DELIVERED' },
+        await tx.payment.updateMany({
+          where: { orderId: order.id, status: PaymentStatus.PENDING },
+          data: { status: PaymentStatus.FAILED, failureReason: 'Checkout abandoned' },
+        });
+
+        await tx.order.update({
+          where: { id: order.id },
+          data: { status: OrderStatus.CANCELLED },
+        });
       });
-    } catch (e: any) {
-      logger.error({ err: e }, 'Auto-progress failed');
+      logger.info({ orderId: order.id }, 'Released stock from abandoned checkout');
+    } catch (err) {
+      logger.error({ err, orderId: order.id }, 'Failed to release stale reservation');
     }
-  }, 10000);
+  }
+}
+
+// ─── Server lifecycle ──────────────────────────────────────────────────
+let backgroundInterval: ReturnType<typeof setInterval>;
+
+const server = app.listen(env.port, () => {
+  logger.info(`Server running on port ${env.port} (${env.nodeEnv})`);
+
+  backgroundInterval = setInterval(async () => {
+    try {
+      await progressOrders();
+      await releaseStaleReservations();
+    } catch (e: any) {
+      logger.error({ err: e }, 'Background job failed');
+    }
+  }, 60_000);
 });
 
 // ─── Graceful shutdown ─────────────────────────────────────────────────
+let shuttingDown = false;
+
 const shutdown = async (signal: string) => {
+  if (shuttingDown) return;
+  shuttingDown = true;
+
   logger.info(`Received ${signal}. Shutting down gracefully...`);
-  clearInterval(autoProgressInterval);
-  server.close(async () => {
-    await prisma.$disconnect();
-    redis.disconnect();
-    logger.info('Database disconnected. Server shut down.');
-    process.exit(0);
-  });
-  // Force exit after 10s if graceful shutdown hangs
-  setTimeout(() => {
+  clearInterval(backgroundInterval);
+
+  const forceExit = setTimeout(() => {
     logger.fatal('Forced shutdown after timeout.');
     process.exit(1);
   }, 10_000);
+  forceExit.unref();
+
+  server.close(async () => {
+    try {
+      await prisma.$disconnect();
+      redis.disconnect();
+    } catch (err) {
+      logger.error({ err }, 'Error during shutdown');
+    }
+    logger.info('Database disconnected. Server shut down.');
+    process.exit(0);
+  });
 };
 
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
+
+process.on('unhandledRejection', (reason) => {
+  logger.error({ err: reason }, 'Unhandled promise rejection');
+});
 
 export default app;
