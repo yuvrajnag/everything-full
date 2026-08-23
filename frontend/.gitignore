@@ -39,3 +39,7 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# Committed env files (secrets belong in .env / Vercel project settings)
+vercel.env
+!.env.example

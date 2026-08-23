@@ -6,6 +6,8 @@ import { useSearchParams } from "next/navigation";
 import { ProductCard } from "./ProductCard";
 import { CategoryNav } from "./CategoryNav";
 import { performSearch } from "@/lib/searchUtils";
+import { apiFetch, errorMessage } from "@/lib/api";
+import { AlertTriangle } from "lucide-react";
 
 interface ProductGridProps {
   initialProducts?: any[];
@@ -18,31 +20,19 @@ export function ProductGrid({ initialProducts }: ProductGridProps = {}) {
   const [selectedCategory, setSelectedCategory] = useState("All");
   const [products, setProducts] = useState<any[]>(initialProducts || []);
   const [isLoading, setIsLoading] = useState(!initialProducts || initialProducts.length === 0);
+  const [loadError, setLoadError] = useState<string | null>(null);
 
   useEffect(() => {
     if (initialProducts && initialProducts.length > 0) return; // Skip fetch if we already have server-rendered products!
     
-    fetch("/api/proxy/products")
-      .then(res => res.json())
-      .then(data => {
-        // The user specifically requested to use local assets instead of Cloudinary.
-        const mappedData = data.map((p: any) => {
-          if (p.imageUrl && p.imageUrl.includes('res.cloudinary.com')) {
-             const filename = p.imageUrl.split('/').pop();
-             p.imageUrl = `/products/${filename}`;
-          }
-          if (p.hoverImageUrl && p.hoverImageUrl.includes('res.cloudinary.com')) {
-             const hoverFilename = p.hoverImageUrl.split('/').pop();
-             p.hoverImageUrl = `/products/${hoverFilename}`;
-          }
-          return p;
-        });
-        
-        setProducts(mappedData);
+    // Image URLs are normalised to local paths by the API, so no rewriting here.
+    apiFetch<any[]>("products")
+      .then((data) => {
+        setProducts(Array.isArray(data) ? data : []);
         setIsLoading(false);
       })
-      .catch(err => {
-        console.error("Failed to load products", err);
+      .catch((err) => {
+        setLoadError(errorMessage(err));
         setIsLoading(false);
       });
   }, [initialProducts]);
@@ -71,7 +61,7 @@ export function ProductGrid({ initialProducts }: ProductGridProps = {}) {
           ) : (
             <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4 mb-16">
               {searchResults.map((product: any) => {
-                const slug = product.title.toLowerCase().replace(/[^a-z0-9]+/g, '-');
+                const slug = product.slug;
                 return (
                   <Link href={`/product/${slug}`} key={product.id} className="block h-full">
                     <ProductCard
@@ -93,7 +83,7 @@ export function ProductGrid({ initialProducts }: ProductGridProps = {}) {
             <h3 className="text-xl font-bold text-white mb-6">You might also like</h3>
             <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4 mb-12">
               {relatedProducts.map((product: any) => {
-                const slug = product.title.toLowerCase().replace(/[^a-z0-9]+/g, '-');
+                const slug = product.slug;
                 return (
                   <Link href={`/product/${slug}`} key={product.id} className="block h-full">
                     <ProductCard
@@ -125,7 +115,13 @@ export function ProductGrid({ initialProducts }: ProductGridProps = {}) {
         
         <div className="w-full max-w-[1400px] mx-auto px-4 pb-20">
           <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
-            {isLoading ? (
+            {loadError ? (
+              <div role="alert" className="col-span-full flex flex-col items-center gap-4 py-20 text-center">
+                <AlertTriangle size={32} className="text-[#FF003C]" />
+                <p className="text-sm font-bold uppercase tracking-widest text-gray-300">Couldn&apos;t load products</p>
+                <p className="text-sm text-gray-500 font-medium max-w-md">{loadError}</p>
+              </div>
+            ) : isLoading ? (
               Array.from({ length: 8 }).map((_, i) => (
                 <div key={`skeleton-${i}`} className="bg-[#111] animate-pulse h-[450px] w-full border border-[#222] flex flex-col justify-between">
                   <div className="w-full h-3/4 bg-[#1a1a1a]"></div>
@@ -138,7 +134,7 @@ export function ProductGrid({ initialProducts }: ProductGridProps = {}) {
               ))
             ) : (
               filteredProducts.map((product) => {
-                const slug = product.title.toLowerCase().replace(/[^a-z0-9]+/g, '-');
+                const slug = product.slug;
                 return (
                   <Link href={`/product/${slug}`} key={product.id} className="block h-full">
                     <ProductCard

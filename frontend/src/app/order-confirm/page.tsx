@@ -1,8 +1,15 @@
-export default function OrderConfirmPage() {
-  return (
-    <div className="flex min-h-screen flex-col items-center justify-center p-24">
-      <h1 className="text-4xl font-bold">Order Confirmation</h1>
-      <p className="mt-4 text-gray-500">Minimal UI scaffold</p>
-    </div>
-  );
+import { redirect } from "next/navigation";
+
+/**
+ * Legacy route. Order confirmation lives on the tracking page, which is where
+ * checkout sends the customer; this used to render an empty "Minimal UI
+ * scaffold" placeholder that a customer could land on.
+ */
+export default async function OrderConfirmPage({
+  searchParams,
+}: {
+  searchParams: Promise<{ id?: string }>;
+}) {
+  const { id } = await searchParams;
+  redirect(id ? `/track?id=${encodeURIComponent(id)}` : "/profile");
 }

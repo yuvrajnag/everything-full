@@ -7,6 +7,9 @@ import { Navbar } from "@/components/layout/Navbar";
 import { Trash2, ShoppingCart, Undo2, Package, Minus, Plus, ArrowRight } from "lucide-react";
 import { ProductCard } from "@/components/home/ProductCard";
 import { useCartStore } from "@/store/cartStore";
+import { apiFetch } from "@/lib/api";
+import { formatRupees } from "@/lib/format";
+import { MAX_QUANTITY_PER_ITEM } from "@/store/cartStore";
 
 export default function CartPage() {
   const cartItems = useCartStore((state) => state.items);
@@ -19,18 +22,20 @@ export default function CartPage() {
 
   useEffect(() => {
     setMounted(true);
-    fetch("/api/proxy/products")
-      .then((res) => res.json())
+    // Recommendations are decorative — a failure just hides the section.
+    apiFetch<any[]>("products")
       .then((data) => {
         if (!Array.isArray(data)) return;
-        // simplistic: pick random 2
-        const shuffled = [...data].sort(() => 0.5 - Math.random());
-        setRelatedProducts(shuffled.slice(0, 2));
+        const inStock = data.filter((p) => p.inStock);
+        const shuffled = [...inStock].sort(() => 0.5 - Math.random());
+        setRelatedProducts(shuffled.slice(0, 4));
       })
-      .catch(err => console.error(err));
-  }, [cartItems]);
+      .catch(() => setRelatedProducts([]));
+    // Only fetched once: re-running on every cart change reshuffled the
+    // recommendations each time an item was added or removed.
+  }, []);
 
-  const formattedTotal = "₹" + total.toLocaleString("en-IN");
+  const formattedTotal = formatRupees(total);
 
   if (!mounted) {
     return null;
@@ -80,7 +85,12 @@ export default function CartPage() {
                       />
                     </div>
                     <div className="flex flex-col pt-1">
-                      <span className="text-lg font-bold text-white tracking-wide uppercase">{item.title}</span>
+                      <Link href={item.slug ? `/product/${item.slug}` : "/"} className="text-lg font-bold text-white tracking-wide uppercase hover:text-[#FF003C] transition-colors">
+                        {item.title}
+                      </Link>
+                      {item.variantLabel && (
+                        <span className="text-[10px] uppercase tracking-widest text-gray-500 mt-1">{item.variantLabel}</span>
+                      )}
                       <span className="md:hidden text-white font-medium mt-3">{item.priceString}</span>
                     </div>
                   </div>
@@ -98,7 +108,9 @@ export default function CartPage() {
                       </span>
                       <button 
                         onClick={() => updateQuantity(item.id, item.quantity + 1)}
-                        className="w-10 h-10 flex items-center justify-center text-gray-400 hover:text-white hover:bg-[#111] transition-colors"
+                        disabled={item.quantity >= MAX_QUANTITY_PER_ITEM}
+                        title={item.quantity >= MAX_QUANTITY_PER_ITEM ? `Maximum ${MAX_QUANTITY_PER_ITEM} per item` : undefined}
+                        className="w-10 h-10 flex items-center justify-center text-gray-400 hover:text-white hover:bg-[#111] transition-colors disabled:text-[#333] disabled:hover:bg-transparent disabled:cursor-not-allowed"
                       >
                         <Plus size={14} />
                       </button>
@@ -107,7 +119,7 @@ export default function CartPage() {
 
                   <div className="col-span-1 md:col-span-2 flex justify-between md:justify-end items-center mt-4 md:mt-0 gap-6">
                     <span className="hidden md:inline-block text-white font-medium text-lg">
-                      {"₹" + (item.price * item.quantity).toLocaleString("en-IN")}
+                      {formatRupees(item.price * item.quantity)}
                     </span>
                     <button onClick={() => removeItem(item.id)} className="text-gray-500 hover:text-[#FF003C] transition-colors">
                       <Trash2 size={18} />

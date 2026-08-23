@@ -4,19 +4,46 @@ import { ProductPurchaseFlow } from "@/components/product/ProductPurchaseFlow";
 import { ProductHeader } from "@/components/layout/ProductHeader";
 import { ProductDetailsModal } from "@/components/product/ProductDetailsModal";
 import { Star } from "lucide-react";
+import Link from "next/link";
 import { notFound } from "next/navigation";
 import fs from "fs";
 import path from "path";
 
 export default async function ProductPage({ params }: { params: Promise<{ slug: string }> }) {
   const resolvedParams = await params;
-  
+
   const baseUrl = process.env.NEXT_PUBLIC_API_URL || "http://localhost:5000/api";
-  const res = await fetch(`${baseUrl}/products/${resolvedParams.slug}`, { cache: 'no-store' });
-  if (!res.ok) {
-    notFound();
+
+  // `cache: no-store` keeps stock levels fresh. A network failure must render
+  // a real error rather than throwing an unhandled exception into the router.
+  let product: any;
+  try {
+    const res = await fetch(`${baseUrl}/products/${encodeURIComponent(resolvedParams.slug)}`, {
+      cache: "no-store",
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (res.status === 404) notFound();
+    if (!res.ok) throw new Error(`Product request failed with ${res.status}`);
+    product = await res.json();
+  } catch (err) {
+    if (err && typeof err === "object" && "digest" in err) throw err; // notFound()
+    console.error("Failed to load product:", err);
+    return (
+      <div className="min-h-screen bg-[#0a0a0a] text-white font-inter flex flex-col items-center">
+        <ProductHeader />
+        <div className="flex-1 flex flex-col items-center justify-center gap-6 px-6 text-center">
+          <h1 className="text-2xl font-bold uppercase tracking-widest">We couldn&apos;t load this product</h1>
+          <p className="text-sm text-gray-400 font-medium max-w-md">
+            The store is having trouble right now. Please refresh in a moment.
+          </p>
+          <Link href="/" className="border border-white hover:bg-white hover:text-black py-4 px-8 text-xs font-bold uppercase tracking-widest transition-colors">
+            Back to all products
+          </Link>
+        </div>
+      </div>
+    );
   }
-  const product = await res.json();
+
   const localProduct = products.find(p => p.id === product.id);
   const rating = localProduct?.rating || 5.0;
 
@@ -36,15 +63,11 @@ export default async function ProductPage({ params }: { params: Promise<{ slug: 
     "everything-laptop-e1": "el",
   };
 
-  const prefix = slugToPrefix[resolvedParams.slug];
+  const prefix =
+    slugToPrefix[resolvedParams.slug] ??
+    product.imageUrl?.split("/").pop()?.replace(/\.[a-z]+$/i, "").split(/[-_]/)[0];
   
-  let mainImageUrl = product.imageUrl;
-  if (mainImageUrl && mainImageUrl.includes('res.cloudinary.com')) {
-     const filename = mainImageUrl.split('/').pop();
-     mainImageUrl = `/products/${filename}`;
-  }
-  
-  const images: string[] = [mainImageUrl];
+  const images: string[] = product.imageUrl ? [product.imageUrl] : [];
   
   if (prefix) {
     const publicProductsDir = path.join(process.cwd(), "public", "products");
