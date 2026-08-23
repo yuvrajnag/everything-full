@@ -578,28 +578,45 @@ router.post('/:id/cancel', requireUser, actionLimiter, async (req: Request, res:
     // ─── Refund any money we actually took, before cancelling anything ──
     // A captured payment is one that reached SUCCESS and carries a provider
     // payment id. COD orders have no captured payment, so nothing is refunded.
-    const capturedPayment = order.payments.find(
+    //
+    // Every captured payment is refunded, not just the first: an order should
+    // only ever carry one, but if a second one ever appears (a webhook, a
+    // manual reconciliation) cancelling while it is still un-refunded would
+    // keep the customer's money.
+    const capturedPayments = order.payments.filter(
       (p: any) => p.status === PaymentStatus.SUCCESS && p.providerPaymentId
     );
 
-    let refund: { id: string; status: string; amount: number } | null = null;
+    const refunds: { paymentId: string; id: string; status: string; amount: number }[] = [];
 
-    if (capturedPayment) {
-      try {
-        refund = await paymentProvider.refundPayment(
-          capturedPayment.providerPaymentId,
-          capturedPayment.amount - capturedPayment.refundedAmount
-        );
-      } catch (err) {
-        // Hard fail: never mark an order cancelled when the customer's money
-        // has not actually been returned.
-        console.error('[ERROR] Refund failed, cancellation aborted:', err);
-        const message =
-          err instanceof PaymentProviderError
-            ? `We could not issue your refund: ${err.message} Your order has not been cancelled — please try again or contact support.`
-            : 'We could not issue your refund, so the order has not been cancelled. Please try again or contact support.';
-        res.status(502).json({ error: message, code: 'REFUND_FAILED' });
-        return;
+    if (capturedPayments.length > 0) {
+      for (const payment of capturedPayments) {
+        const outstanding = payment.amount - (payment.refundedAmount ?? 0);
+        if (outstanding <= 0) {
+          // Already refunded in full; nothing left to return for this payment.
+          continue;
+        }
+        try {
+          const result = await paymentProvider.refundPayment(payment.providerPaymentId, outstanding);
+          refunds.push({ paymentId: payment.id, ...result });
+        } catch (err) {
+          // Hard fail: never mark an order cancelled when the customer's money
+          // has not actually been returned. Any refund already issued in this
+          // loop stays issued and is recorded below on the next attempt, which
+          // skips it because its outstanding amount is then zero.
+          console.error('[ERROR] Refund failed, cancellation aborted:', err);
+          if (refunds.length > 0) {
+            await recordRefunds(refunds).catch((e) =>
+              console.error('[ERROR] Could not record partial refunds:', e)
+            );
+          }
+          const message =
+            err instanceof PaymentProviderError
+              ? `We could not issue your refund: ${err.message} Your order has not been cancelled — please try again or contact support.`
+              : 'We could not issue your refund, so the order has not been cancelled. Please try again or contact support.';
+          res.status(502).json({ error: message, code: 'REFUND_FAILED' });
+          return;
+        }
       }
     } else if (order.status === OrderStatus.PAID) {
       // The order says PAID but no captured payment is on file. Cancelling here
@@ -639,9 +656,9 @@ router.post('/:id/cancel', requireUser, actionLimiter, async (req: Request, res:
         }
       }
 
-      if (capturedPayment && refund) {
+      for (const refund of refunds) {
         await tx.payment.update({
-          where: { id: capturedPayment.id },
+          where: { id: refund.paymentId },
           data: {
             status: PaymentStatus.REFUNDED,
             providerRefundId: refund.id,
@@ -665,8 +682,8 @@ router.post('/:id/cancel', requireUser, actionLimiter, async (req: Request, res:
           userId: order.userId,
           details: JSON.stringify({
             previousStatus: fresh.status,
-            refundId: refund?.id ?? null,
-            refundedAmount: refund?.amount ?? 0,
+            refundIds: refunds.map((r) => r.id),
+            refundedAmount: refunds.reduce((sum, r) => sum + r.amount, 0),
           }),
         },
       });
@@ -678,11 +695,13 @@ router.post('/:id/cancel', requireUser, actionLimiter, async (req: Request, res:
       });
     });
 
+    const refundedTotal = refunds.reduce((sum, r) => sum + r.amount, 0);
     res.json({
       ...serializeOrder(updated),
-      refund: refund
-        ? { id: refund.id, status: refund.status, amount: refund.amount }
-        : null,
+      refund:
+        refunds.length > 0
+          ? { id: refunds[0]!.id, status: refunds[0]!.status, amount: refundedTotal }
+          : null,
     });
   } catch (error) {
     if (error instanceof AlreadyFinalizedError) {
@@ -792,6 +811,28 @@ async function priceItems(
   }
 
   return { orderItemsData: [...merged.values()], calculatedTotal };
+}
+
+/**
+ * Persists refunds that were genuinely issued, even though the cancellation as
+ * a whole is being aborted. Without this the provider would hold a refund we
+ * have no record of, and a retry would try to issue it a second time.
+ */
+async function recordRefunds(
+  refunds: { paymentId: string; id: string; amount: number }[]
+): Promise<void> {
+  await prisma.$transaction(async (tx) => {
+    for (const refund of refunds) {
+      await tx.payment.update({
+        where: { id: refund.paymentId },
+        data: {
+          status: PaymentStatus.REFUNDED,
+          providerRefundId: refund.id,
+          refundedAmount: refund.amount,
+        },
+      });
+    }
+  });
 }
 
 /** Turns a reservation into a real stock decrement. */

@@ -13,7 +13,9 @@
     "prisma:migrate": "prisma migrate deploy",
     "prisma:studio": "prisma studio",
     "db:push": "prisma db push",
-    "promote-admin": "tsx src/promoteAdmin.ts"
+    "promote-admin": "tsx src/promoteAdmin.ts",
+    "prisma:migrate:dev": "prisma migrate dev",
+    "prisma:baseline": "prisma migrate resolve --applied 00000000000000_baseline_existing_schema"
   },
   "keywords": [],
   "author": "",
